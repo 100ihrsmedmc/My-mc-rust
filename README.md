@@ -97,7 +97,7 @@ report shows the modules were accepted on Metal. That makes "a real Metal driver
 accepts the lowered modules" a checked fact on the backend iOS actually uses.
 This macOS job is gated on the `verify_metal` input (default off) because
 GitHub-hosted macOS runners are not available to every account; turn it on when
-the account can provision `macos-14`.
+the account can provision `macos-15`.
 It runs against the packs the repository ships for this (`post-test`,
 `terrain-test`, `config-test`) and the run fails if any pack fails to open, any
 module fails to lower, or wgpu rejects a module.
