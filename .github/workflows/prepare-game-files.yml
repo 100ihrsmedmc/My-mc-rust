@@ -164,7 +164,10 @@ jobs:
         run: |
           set -euo pipefail
           cd horizon
-          ./target/release/horizon-prepare --complete \
+          # `--complete` also copies the sounds, then fails unless the resources are
+          # complete. `--prepare` imports the pinned game files first: a fresh checkout
+          # has no earlier import to reuse.
+          ./target/release/horizon-prepare --complete --prepare \
             --server-jar "$RUNNER_TEMP/server.jar" \
             --minecraft-dir "$RUNNER_TEMP/minecraft" \
             --java-home "${{ steps.jdk.outputs.java_home }}" \
