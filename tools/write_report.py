@@ -116,10 +116,18 @@ def main() -> int:
             name = pack.get("name") or pack.get("path")
             add(f"  - `{name}`: {pack.get('stage_files', 0)} stage files, "
                 f"{pack.get('modules_lowered', 0)} modules, "
-                f"{len(pack.get('backend_failures', []))} backend failures")
+                f"{len(pack.get('backend_failures', []))} backend failures, "
+                f"{len(pack.get('gpu_failures', []))} wgpu rejections")
         add("- Every module lowered to Metal (MSL), SPIR-V, HLSL and GLSL without a GPU.")
-        add("- This proves the loader can discover, parse, translate and lower packs. It does "
-            "**not** prove a pack renders correctly on a phone.")
+        if shader.get("modules_accepted_by_wgpu"):
+            add(f"- Every lowered module was also handed to the renderer's own "
+                f"`create_shader_module` call on a headless wgpu adapter "
+                f"(`{shader.get('wgpu_adapter')}`) and accepted.")
+        else:
+            add("- Module acceptance by wgpu's `create_shader_module` was **not** checked "
+                "(no headless adapter), so only lowering is claimed.")
+        add("- This proves the loader can discover, parse, translate, lower and hand packs "
+            "to the renderer. It does **not** prove a pack renders correctly on a phone.")
     add("")
     if findings.get("findings"):
         add("| Claim | Status | Detail |")

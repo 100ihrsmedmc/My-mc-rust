@@ -81,17 +81,22 @@ resources, and fails the run if any is non-zero.
 The probe builds against the game's real loader (`horizon-shaders`) and, with no
 GPU, discovers packs in a `shaderpacks/` folder, opens them, preprocesses every
 stage file, loads each dimension's programs and lowers every module through
-`naga` to **Metal (MSL)**, SPIR-V, HLSL and GLSL. It runs against the two packs
-the repository ships for this (`post-test`, `terrain-test`) and the run fails if
-any pack fails to open or any module fails to lower.
+`naga` to **Metal (MSL)**, SPIR-V, HLSL and GLSL. Built with `--features gpu`
+(as the workflow does), it then hands every lowered module to the renderer's own
+call, wgpu's `create_shader_module(ShaderSource::Naga(..))`, against a headless
+software adapter (lavapipe), so module acceptance is checked rather than assumed.
+It runs against the two packs the repository ships for this (`post-test`,
+`terrain-test`) and the run fails if any pack fails to open, any module fails to
+lower, or wgpu rejects a module.
 
 **Be precise about what that proves.** It proves the loader can discover, parse,
-translate and lower packs — the path a pack must survive to be applied. It does
-**not** prove a pack renders as its author intended on a phone. The repository's
-own iOS notes say third-party pack rendering is not established and needs a
-physical iPad; the probe's report says so too, and the validation report keeps
-that distinction. The shader-support question is answered honestly in
-`VALIDATION-REPORT.md`'s findings table, which marks on-device rendering
+translate, lower and hand packs to the renderer — the path a pack must survive to
+be applied. It does **not** prove a pack renders as its author intended on a
+phone: module acceptance on a software adapter is necessary but not sufficient.
+The repository's own iOS notes say third-party pack rendering is not established
+and needs a physical iPad; the probe's report says so too, and the validation
+report keeps that distinction. The shader-support question is answered honestly
+in `VALIDATION-REPORT.md`'s findings table, which marks on-device rendering
 **NOT VERIFIED** and lists the OpenGL/Metal limitations.
 
 ### Package and archive — `tools/verify_package.py`

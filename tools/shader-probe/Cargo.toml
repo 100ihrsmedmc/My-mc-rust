@@ -21,6 +21,14 @@ description = "Headless verification that Horizon's Iris/OptiFine shader-pack pa
 horizon-shaders = { path = "../../crates/horizon-shaders" }
 naga = { version = "30.0.1", features = ["glsl-in", "wgsl-in", "spv-out", "hlsl-out", "glsl-out", "msl-out"] }
 serde_json = "1"
+# The `gpu` feature adds the renderer's own module-creation call (wgpu's
+# `create_shader_module`), which the naga writers alone do not exercise. Off by
+# default so the base probe stays light; CI builds with `--features gpu`.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "metal", "gles", "naga-ir"], optional = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+gpu = ["dep:wgpu", "dep:pollster"]
 
 # Use the same naga the game uses. The game's workspace patches crates.io naga
 # with its own copy (`third_party/naga`), which carries the GLSL frontend fixes

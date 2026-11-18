@@ -80,7 +80,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libasound2-dev libudev-dev libcap-dev \
-            zip unzip file
+            zip unzip file \
+            mesa-vulkan-drivers libvulkan1
 
       - name: Install the Rust toolchain
         run: |
@@ -190,7 +191,10 @@ jobs:
             --pack-resources "$RUNNER_TEMP/resources" \
             --out "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip"
           ls -l "$RUNNER_TEMP/dist"
-          sha256sum "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip" | tee "$RUNNER_TEMP/dist/SHA256SUMS.txt"
+          # Write the sums with the file's base name: an absolute runner path would
+          # make `sha256sum -c SHA256SUMS.txt` fail for whoever downloads it.
+          (cd "$RUNNER_TEMP/dist" && sha256sum "${{ steps.lock.outputs.version }}.zip" > SHA256SUMS.txt)
+          cat "$RUNNER_TEMP/dist/SHA256SUMS.txt"
           echo "sha256=$(sha256sum "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Verify audio (OGG)
@@ -216,10 +220,11 @@ jobs:
           set -euo pipefail
           # The probe links the game's `horizon-shaders` crate by a relative path, so it
           # is built from inside the checkout. It is its own workspace and never edits
-          # the game's Cargo.toml.
+          # the game's Cargo.toml. `--features gpu` adds the renderer's own
+          # `create_shader_module` call, run against the software Vulkan adapter.
           rm -rf horizon/tools/shader-probe
           cp -r tooling/tools/shader-probe horizon/tools/shader-probe
-          cargo build --release \
+          cargo build --release --features gpu \
             --manifest-path horizon/tools/shader-probe/Cargo.toml \
             --target-dir "$RUNNER_TEMP/probe-target"
 
@@ -228,6 +233,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/reports"
+          # Force the software Vulkan adapter so the run is deterministic and needs no GPU.
+          # The lavapipe ICD's file name varies by distribution.
+          export WGPU_BACKEND=vulkan
+          for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+            if [ -f "$icd" ]; then export VK_ICD_FILENAMES="$icd"; break; fi
+          done
+          echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-<unset>}"
           "$RUNNER_TEMP/probe-target/release/horizon-shader-probe" \
             --dir horizon/crates/horizon-shaders/tests/packs \
             --report "$RUNNER_TEMP/reports/shader-report.json"

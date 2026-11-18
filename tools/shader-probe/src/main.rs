@@ -19,6 +19,64 @@ use horizon_shaders::{
     GbuffersInputs, GameInputs, GeometryInputs, Parts, Post,
 };
 
+/// The renderer's own next step after lowering: hand the naga module to wgpu.
+///
+/// `naga`'s writers only prove a module *can* be written in a target language.
+/// The game does one more thing the writers do not: `pack_post.rs` calls
+/// `wgpu::Device::create_shader_module(ShaderSource::Naga(..))`, and wgpu's own
+/// validation (and, on a real backend, the driver's compiler) is what decides
+/// whether the module is accepted. This stage runs that call headless against a
+/// software adapter when one is present, so the probe covers the renderer's real
+/// boundary instead of stopping one step short of it.
+#[cfg(feature = "gpu")]
+mod gpu {
+    /// A headless wgpu device, or the reason there is none (no adapter).
+    pub struct Gpu {
+        device: wgpu::Device,
+        pub adapter: String,
+    }
+
+    impl Gpu {
+        /// Opens the first adapter any backend offers, without a display handle.
+        pub fn open() -> Result<Self, String> {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                ..Default::default()
+            }))
+            .map_err(|e| format!("no wgpu adapter: {e}"))?;
+            let info = adapter.get_info();
+            let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("horizon-shader-probe"),
+                ..Default::default()
+            }))
+            .map_err(|e| format!("no wgpu device: {e}"))?;
+            Ok(Self {
+                device,
+                adapter: format!("{} ({:?})", info.name, info.backend),
+            })
+        }
+
+        /// Runs the renderer's `create_shader_module` call on one module.
+        ///
+        /// Returns the validation error when wgpu or the backend rejects it. The
+        /// module is cloned because the renderer takes it by value.
+        pub fn accepts(&self, name: &str, module: &naga::Module) -> Result<(), String> {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let _module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(name),
+                source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module.clone())),
+            });
+            match pollster::block_on(scope.pop()) {
+                Some(error) => Err(error.to_string()),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
 /// The vertex inputs the game supplies to a pack's programs. Mirrors
 /// `crates/horizon-shaders/tests/it/real_packs.rs`, which mirrors the renderer.
 fn terrain_inputs() -> GbuffersInputs {
@@ -220,7 +278,12 @@ fn all_modules(post: &Post) -> Vec<(String, &naga::Module)> {
     modules
 }
 
-fn probe_pack(pack: &Pack, probes: &mut Vec<String>, errors: &mut Vec<String>) -> serde_json::Value {
+fn probe_pack(
+    pack: &Pack,
+    probes: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    #[cfg(feature = "gpu")] gpu: Option<&gpu::Gpu>,
+) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert("name".into(), pack.name().into());
 
@@ -263,6 +326,8 @@ fn probe_pack(pack: &Pack, probes: &mut Vec<String>, errors: &mut Vec<String>) -
     let inputs = game_inputs(&terrain);
     let mut programs = 0;
     let mut backend_failures: Vec<String> = Vec::new();
+    #[cfg(feature = "gpu")]
+    let mut gpu_failures: Vec<String> = Vec::new();
     let mut notes_total = 0;
     let mut dimensions = serde_json::Map::new();
     for id in [0, -1, 1] {
@@ -275,6 +340,13 @@ fn probe_pack(pack: &Pack, probes: &mut Vec<String>, errors: &mut Vec<String>) -
         for (name, module) in &modules {
             for backend in [Backend::Msl, Backend::Spv, Backend::Hlsl, Backend::Glsl] {
                 lower(name, module, backend, &mut backend_failures);
+            }
+            // The renderer's own next call: wgpu's `create_shader_module`.
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = gpu {
+                if let Err(error) = gpu.accepts(name, module) {
+                    gpu_failures.push(format!("{name}: {error}"));
+                }
             }
         }
         dimensions.insert(
@@ -296,19 +368,43 @@ fn probe_pack(pack: &Pack, probes: &mut Vec<String>, errors: &mut Vec<String>) -
     entry.insert("modules_lowered".into(), programs.into());
     entry.insert("post_notes".into(), notes_total.into());
     entry.insert("backend_failures".into(), serde_json::json!(backend_failures));
+    #[cfg(feature = "gpu")]
+    {
+        entry.insert("modules_accepted_by_wgpu".into(), serde_json::json!(gpu.is_some()));
+        entry.insert("gpu_failures".into(), serde_json::json!(gpu_failures));
+    }
 
     let applies = !pack.all_files().is_empty();
-    entry.insert("applies".into(), serde_json::json!(applies && backend_failures.is_empty()));
+    #[cfg(not(feature = "gpu"))]
+    let clean = backend_failures.is_empty();
+    #[cfg(feature = "gpu")]
+    let clean = backend_failures.is_empty() && gpu_failures.is_empty();
+    entry.insert("applies".into(), serde_json::json!(applies && clean));
 
-    if backend_failures.is_empty() {
-        probes.push(format!("{}: {} stage files, {programs} modules lower to MSL/SPV/HLSL/GLSL", pack.name(), stage_files));
-    } else {
-        errors.push(format!(
-            "{}: {} of {} module/backend lowers failed; first: {}",
+    if clean {
+        #[cfg(feature = "gpu")]
+        let suffix = match gpu {
+            Some(_) => ", and every module is accepted by wgpu's create_shader_module",
+            None => " (no wgpu adapter: module acceptance not checked)",
+        };
+        #[cfg(not(feature = "gpu"))]
+        let suffix = "";
+        probes.push(format!(
+            "{}: {} stage files, {programs} modules lower to MSL/SPV/HLSL/GLSL{suffix}",
             pack.name(),
-            backend_failures.len(),
-            programs * 4,
-            backend_failures[0]
+            stage_files
+        ));
+    } else {
+        #[allow(unused_mut)]
+        let mut detail: Vec<String> = backend_failures.clone();
+        #[cfg(feature = "gpu")]
+        detail.extend(gpu_failures.iter().cloned());
+        errors.push(format!(
+            "{}: {} lowering/acceptance failure(s) across {} modules; first: {}",
+            pack.name(),
+            detail.len(),
+            programs,
+            detail.first().cloned().unwrap_or_default()
         ));
     }
     serde_json::Value::Object(entry)
@@ -359,9 +455,32 @@ fn main() -> ExitCode {
     let mut probes = Vec::new();
     let mut errors = Vec::new();
     let mut packs = Vec::new();
+
+    // With the `gpu` feature, open a headless wgpu device once (a software adapter
+    // is enough) so every module also goes through the renderer's own
+    // `create_shader_module` call. Without an adapter the run still reports
+    // lowering, and says module acceptance was not checked.
+    #[cfg(feature = "gpu")]
+    let gpu = match gpu::Gpu::open() {
+        Ok(gpu) => {
+            eprintln!("wgpu adapter: {}", gpu.adapter);
+            Some(gpu)
+        }
+        Err(reason) => {
+            eprintln!("note: {reason}; module acceptance by wgpu will not be checked");
+            None
+        }
+    };
+
     for path in &paths {
         match Pack::open(path) {
-            Ok(pack) => packs.push(probe_pack(&pack, &mut probes, &mut errors)),
+            Ok(pack) => packs.push(probe_pack(
+                &pack,
+                &mut probes,
+                &mut errors,
+                #[cfg(feature = "gpu")]
+                gpu.as_ref(),
+            )),
             Err(error) => {
                 errors.push(format!("{}: cannot open: {error}", path.display()));
                 packs.push(serde_json::json!({
@@ -373,16 +492,23 @@ fn main() -> ExitCode {
         }
     }
 
-    let report = serde_json::json!({
+    #[allow(unused_mut)]
+    let mut report = serde_json::json!({
         "packs": packs,
         "lowered": probes,
         "failures": errors,
         "caveat": "MSL/SPIR-V/HLSL/GLSL lowering proves the loader can hand a translated \
-                   module to the renderer's shader writer. It does not prove the pack renders \
-                   as intended on a device: that needs a GPU (a physical iPad), which this \
-                   headless probe does not have.",
+                   module to the renderer's shader writer, and (with the `gpu` feature) \
+                   wgpu's `create_shader_module` accepts it on a software adapter. Neither \
+                   proves the pack renders as intended on a device: that needs the real \
+                   Metal backend on a physical iPad, which this headless probe does not have.",
         "ok": errors.is_empty(),
     });
+    #[cfg(feature = "gpu")]
+    if let Some(map) = report.as_object_mut() {
+        map.insert("wgpu_adapter".into(), serde_json::json!(gpu.as_ref().map(|g| g.adapter.clone())));
+        map.insert("modules_accepted_by_wgpu".into(), serde_json::json!(gpu.is_some()));
+    }
     if let Some(path) = &report_path {
         if let Err(error) = std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()) {
             eprintln!("error: writing {}: {error}", path.display());

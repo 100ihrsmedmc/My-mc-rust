@@ -55,6 +55,14 @@ FINDINGS: list[tuple[str, str, str]] = [
         "the loader can hand a module to the renderer.",
     ),
     (
+        "Renderer module acceptance (wgpu)",
+        "verified",
+        "Every lowered module is handed to the renderer's own call, wgpu's "
+        "`create_shader_module(ShaderSource::Naga(..))`, on a headless wgpu adapter "
+        "(software is enough). This is the boundary the game crosses after lowering; "
+        "it is checked here, not assumed.",
+    ),
+    (
         "Shader configuration and pack metadata preserved",
         "verified",
         "The pack's options, screens, profiles and `shaders.properties` keys are read "
@@ -85,9 +93,10 @@ FINDINGS: list[tuple[str, str, str]] = [
     (
         "Shader support is genuinely functional?",
         "limited",
-        "The loader path is implemented and testable (discovery, parsing, "
-        "translation, MSL lowering all pass here). That is not the same as packs "
-        "rendering correctly on a phone, which this workflow cannot confirm.",
+        "The loader path is implemented and testable: discovery, parsing, "
+        "translation, MSL lowering and wgpu's own create_shader_module all pass here. "
+        "That is not the same as packs rendering correctly on a phone, which this "
+        "workflow cannot confirm.",
     ),
 ]
 
@@ -101,6 +110,23 @@ def summarise(report: dict, expected: list[str]) -> int:
     failures = report.get("failures", [])
     problems: list[str] = []
 
+    # The `gpu` stage is what makes module acceptance a checked fact rather than an
+    # assumption. A report without it is a weaker run; say so instead of passing quietly.
+    accepted = report.get("modules_accepted_by_wgpu")
+    adapter = report.get("wgpu_adapter")
+    if accepted is None:
+        problems.append(
+            "the probe report has no `modules_accepted_by_wgpu`: it was built without the "
+            "`gpu` feature, so wgpu's create_shader_module was never exercised"
+        )
+    elif not accepted:
+        problems.append(
+            "no headless wgpu adapter was available, so module acceptance by "
+            "create_shader_module was not checked"
+        )
+    else:
+        print(f"wgpu adapter: {adapter}")
+
     print(f"Packs discovered: {len(packs)}")
     total_modules = 0
     total_lowers = 0
@@ -112,15 +138,18 @@ def summarise(report: dict, expected: list[str]) -> int:
             continue
         modules = pack.get("modules_lowered", 0)
         backends = pack.get("backend_failures", [])
+        gpu = pack.get("gpu_failures", [])
         total_modules += modules
         total_lowers += modules * 4
-        state = "ok" if pack.get("applies") and not backends else "FAILED"
+        state = "ok" if pack.get("applies") and not backends and not gpu else "FAILED"
         print(
             f"  {name}: {pack.get('stage_files', 0)} stage files, {modules} modules, "
-            f"{len(backends)} backend failures -> {state}"
+            f"{len(backends)} backend failures, {len(gpu)} wgpu rejections -> {state}"
         )
         for line in backends[:5]:
             problems.append(f"{name}: {line}")
+        for line in gpu[:5]:
+            problems.append(f"{name}: wgpu rejected: {line}")
 
     for line in failures:
         problems.append(line)
@@ -153,8 +182,10 @@ def summarise(report: dict, expected: list[str]) -> int:
 
     print(
         "\nShader loader verification: PASS.\n"
-        "On-device (Metal) rendering: NOT VERIFIED by this workflow -- lowering to MSL "
-        "is necessary but not sufficient; a physical iPad is required."
+        "The loader discovers, parses, translates and lowers every pack, and wgpu's "
+        "create_shader_module accepts every lowered module on a headless adapter.\n"
+        "On-device (Metal) rendering: NOT VERIFIED by this workflow -- module acceptance "
+        "is necessary but not sufficient; the real Metal backend on a physical iPad is required."
     )
     return 0
 
