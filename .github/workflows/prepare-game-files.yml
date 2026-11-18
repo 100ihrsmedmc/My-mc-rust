@@ -318,3 +318,86 @@ jobs:
             echo "Artifact: **horizon-resources** (contains the archive, its SHA-256 and the validation report)."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$RUNNER_TEMP/dist/VALIDATION-REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+
+  # A second, independent check of the shader path on the one backend iOS really
+  # uses: Metal. The `prepare` job runs on Linux and reaches the software Vulkan
+  # adapter, which proves lowering and wgpu's create_shader_module, but it cannot
+  # prove a real Metal driver accepts the modules. This job runs the same probe on
+  # a macOS runner, requires the Metal backend, and fails unless the modules are
+  # accepted there -- so "Metal works" is a checked fact, not an assumption.
+  metal:
+    name: Verify the shader path on Metal
+    runs-on: macos-14
+    timeout-minutes: 45
+    if: ${{ inputs.verify_shaders }}
+    steps:
+      - name: Check out this repository (the tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: Check out the Horizon iOS source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          path: horizon
+
+      - name: Install the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Build the headless shader probe (Metal backend)
+        run: |
+          set -euo pipefail
+          # Same standalone crate as the Linux job; `gpu` pulls in wgpu with the
+          # `metal` feature, which is the iOS renderer's backend.
+          rm -rf horizon/tools/shader-probe
+          cp -r tooling/tools/shader-probe horizon/tools/shader-probe
+          cargo build --release --features gpu \
+            --manifest-path horizon/tools/shader-probe/Cargo.toml \
+            --target-dir "$RUNNER_TEMP/probe-target"
+
+      - name: Verify the shader-pack path on Metal
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/reports"
+          # Require the Metal backend: the probe fails (exit 3) rather than falling
+          # back to another backend, so a pass means Metal accepted every module.
+          "$RUNNER_TEMP/probe-target/release/horizon-shader-probe" \
+            --require-backend metal \
+            --dir horizon/crates/horizon-shaders/tests/packs \
+            --dir tooling/tools/shader-probe/tests/packs \
+            --report "$RUNNER_TEMP/reports/shader-report-metal.json"
+          python3 tooling/tools/verify_shader.py \
+            --report "$RUNNER_TEMP/reports/shader-report-metal.json" \
+            --require-backend metal \
+            --expect-pack post-test \
+            --expect-pack terrain-test \
+            --expect-pack config-test \
+            --expect-config
+
+      - name: Summarise the Metal run
+        run: |
+          set -euo pipefail
+          {
+            echo "## Shader path on Metal (macOS runner)"
+            echo
+            python3 - "$RUNNER_TEMP/reports/shader-report-metal.json" <<'PY'
+          import json, sys
+          report = json.loads(open(sys.argv[1]).read())
+          print(f"- Adapter: `{report.get('wgpu_adapter')}`")
+          print(f"- Backend: `{report.get('wgpu_backend')}`")
+          print(f"- Packs: {len(report.get('packs', []))}")
+          print(f"- Modules accepted by wgpu's create_shader_module on Metal: "
+                f"{report.get('modules_accepted_by_wgpu')}")
+          print(f"- Lowering failures: {len(report.get('failures', []))}")
+          PY
+            echo
+            echo "This proves a real Metal driver accepts the lowered modules. It still"
+            echo "does not prove a pack renders as intended on a phone; that needs a"
+            echo "physical iPad."
+          } >> "$GITHUB_STEP_SUMMARY"

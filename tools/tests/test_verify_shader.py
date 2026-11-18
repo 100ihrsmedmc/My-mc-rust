@@ -133,6 +133,36 @@ class Summarise(unittest.TestCase):
         self.assertNotEqual(status, 0)
 
 
+class RequireBackend(unittest.TestCase):
+    def run_it(self, report, require_backend):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            status = verify_shader.summarise(report, [], False, require_backend)
+        return status, out.getvalue()
+
+    def test_required_backend_matches(self):
+        report = clean_report(wgpu_backend="Metal")
+        status, out = self.run_it(report, "metal")
+        self.assertEqual(status, 0)
+        self.assertIn("Backend required and used", out)
+
+    def test_required_backend_mismatch_fails(self):
+        report = clean_report(wgpu_backend="Vulkan")
+        status, out = self.run_it(report, "metal")
+        self.assertNotEqual(status, 0)
+        self.assertIn("required but the probe ran on vulkan", out)
+
+    def test_required_backend_without_acceptance_fails(self):
+        report = clean_report(modules_accepted_by_wgpu=False, wgpu_backend=None)
+        status, _ = self.run_it(report, "metal")
+        self.assertNotEqual(status, 0)
+
+    def test_no_requirement_ignores_backend(self):
+        report = clean_report(wgpu_backend="Vulkan")
+        status, _ = self.run_it(report, None)
+        self.assertEqual(status, 0)
+
+
 class Findings(unittest.TestCase):
     def test_findings_are_honest_about_on_device_rendering(self):
         claims = {claim: status for claim, status, _ in verify_shader.FINDINGS}

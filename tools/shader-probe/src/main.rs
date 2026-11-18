@@ -34,12 +34,26 @@ mod gpu {
     pub struct Gpu {
         device: wgpu::Device,
         pub adapter: String,
+        pub backend: String,
     }
 
     impl Gpu {
         /// Opens the first adapter any backend offers, without a display handle.
-        pub fn open() -> Result<Self, String> {
+        ///
+        /// `required` names a backend that must be the one selected (`metal`,
+        /// `vulkan`, ...). It exists so a run on a machine with a real GPU can
+        /// prove which backend actually accepted the modules, rather than
+        /// reporting whichever adapter happened to come first.
+        pub fn open(required: Option<&str>) -> Result<Self, String> {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: match required {
+                    Some("metal") => wgpu::Backends::METAL,
+                    Some("vulkan") => wgpu::Backends::VULKAN,
+                    Some("dx12") => wgpu::Backends::DX12,
+                    Some("gl") => wgpu::Backends::GL,
+                    Some(other) => return Err(format!("unknown backend {other:?}")),
+                    None => wgpu::Backends::all(),
+                },
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -48,6 +62,12 @@ mod gpu {
             }))
             .map_err(|e| format!("no wgpu adapter: {e}"))?;
             let info = adapter.get_info();
+            let backend = format!("{:?}", info.backend);
+            if let Some(want) = required {
+                if !backend.eq_ignore_ascii_case(want) {
+                    return Err(format!("the adapter is on {backend}, not the required {want}"));
+                }
+            }
             let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("horizon-shader-probe"),
                 ..Default::default()
@@ -55,7 +75,8 @@ mod gpu {
             .map_err(|e| format!("no wgpu device: {e}"))?;
             Ok(Self {
                 device,
-                adapter: format!("{} ({:?})", info.name, info.backend),
+                adapter: format!("{} ({})", info.name, backend),
+                backend,
             })
         }
 
@@ -538,6 +559,8 @@ fn pack_paths(args: &[String]) -> Result<Vec<PathBuf>, String> {
             }
         } else if arg == "--report" {
             index += 1;
+        } else if arg == "--require-backend" {
+            index += 1;
         } else if !arg.starts_with("--") {
             paths.push(PathBuf::from(arg));
         }
@@ -553,6 +576,13 @@ fn main() -> ExitCode {
         .position(|a| a == "--report")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
+    // `--require-backend metal` makes a run prove the modules were accepted by a
+    // specific backend (a real GPU), not just by whichever adapter came first.
+    let required_backend = args
+        .iter()
+        .position(|a| a == "--require-backend")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let paths = match pack_paths(&args) {
         Ok(paths) => paths,
         Err(error) => {
@@ -574,13 +604,19 @@ fn main() -> ExitCode {
     // `create_shader_module` call. Without an adapter the run still reports
     // lowering, and says module acceptance was not checked.
     #[cfg(feature = "gpu")]
-    let gpu = match gpu::Gpu::open() {
+    let gpu = match gpu::Gpu::open(required_backend.as_deref()) {
         Ok(gpu) => {
             eprintln!("wgpu adapter: {}", gpu.adapter);
             Some(gpu)
         }
         Err(reason) => {
             eprintln!("note: {reason}; module acceptance by wgpu will not be checked");
+            if required_backend.is_some() {
+                // A required backend that could not be opened is a hard failure: the
+                // caller asked to prove a specific backend accepted the modules.
+                eprintln!("error: required backend was not available: {reason}");
+                return ExitCode::from(3);
+            }
             None
         }
     };
@@ -657,7 +693,9 @@ fn main() -> ExitCode {
     #[cfg(feature = "gpu")]
     if let Some(map) = report.as_object_mut() {
         map.insert("wgpu_adapter".into(), serde_json::json!(gpu.as_ref().map(|g| g.adapter.clone())));
+        map.insert("wgpu_backend".into(), serde_json::json!(gpu.as_ref().map(|g| g.backend.clone())));
         map.insert("modules_accepted_by_wgpu".into(), serde_json::json!(gpu.is_some()));
+        map.insert("required_backend".into(), serde_json::json!(required_backend.clone()));
     }
     if let Some(path) = &report_path {
         if let Err(error) = std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()) {

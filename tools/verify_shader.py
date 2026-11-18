@@ -105,7 +105,8 @@ def verdict_label(status: str) -> str:
     return {"verified": "PASS (loader level)", "unverified": "NOT VERIFIED", "limited": "LIMITED"}[status]
 
 
-def summarise(report: dict, expected: list[str], expect_config: bool = False) -> int:
+def summarise(report: dict, expected: list[str], expect_config: bool = False,
+              require_backend: str | None = None) -> int:
     packs = report.get("packs", [])
     failures = report.get("failures", [])
     problems: list[str] = []
@@ -126,6 +127,22 @@ def summarise(report: dict, expected: list[str], expect_config: bool = False) ->
         )
     else:
         print(f"wgpu adapter: {adapter}")
+
+    # When a specific backend was required (a real GPU), the report must show the
+    # modules were accepted on that backend -- not merely on some adapter.
+    if require_backend is not None:
+        backend = (report.get("wgpu_backend") or "").lower()
+        if not accepted:
+            problems.append(
+                f"a {require_backend} backend was required but the modules were not accepted "
+                "by any adapter"
+            )
+        elif backend != require_backend.lower():
+            problems.append(
+                f"a {require_backend} backend was required but the probe ran on {backend or '?'}"
+            )
+        else:
+            print(f"Backend required and used: {report.get('wgpu_backend')}")
 
     print(f"Packs discovered: {len(packs)}")
     total_modules = 0
@@ -267,13 +284,18 @@ def main() -> int:
         action="store_true",
         help="require that at least one pack produced non-zero options, screens and profiles",
     )
+    parser.add_argument(
+        "--require-backend",
+        default=None,
+        help="require that the report shows module acceptance on this wgpu backend (e.g. metal)",
+    )
     args = parser.parse_args()
 
     if not args.report.is_file():
         print(f"error: {args.report} is missing: run the probe first", file=sys.stderr)
         return 1
     report = json.loads(args.report.read_text())
-    status = summarise(report, args.expect_pack, args.expect_config)
+    status = summarise(report, args.expect_pack, args.expect_config, args.require_backend)
 
     if args.write:
         args.write.parent.mkdir(parents=True, exist_ok=True)

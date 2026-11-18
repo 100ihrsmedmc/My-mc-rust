@@ -15,8 +15,10 @@ The package is ~400 MB and is what the phone imports on first run.
      (default `datlun2k11-pixel/a-bit-better-horizon-ios`),
    - `source_ref` — its branch, tag or commit (default `main`),
    - `verify_shaders` — build and run the headless shader probe (default on).
-4. Wait for the single job to finish (roughly 20–40 minutes: the Rust build
-   dominates, then the resource preparation, packing and checks).
+4. Wait for the two jobs to finish (roughly 20–45 minutes: the Rust build
+   dominates, then the resource preparation, packing and checks). `prepare`
+   builds and verifies the package on Linux; `metal` runs the shader probe again
+   on a macOS runner and requires the real Metal backend. Both must be green.
 
 Command line, if you prefer:
 
@@ -85,14 +87,21 @@ stage file, loads each dimension's programs and lowers every module through
 (as the workflow does), it then hands every lowered module to the renderer's own
 call, wgpu's `create_shader_module(ShaderSource::Naga(..))`, against a headless
 software adapter (lavapipe), so module acceptance is checked rather than assumed.
-It runs against the two packs the repository ships for this (`post-test`,
-`terrain-test`) and the run fails if any pack fails to open, any module fails to
-lower, or wgpu rejects a module.
+The workflow then runs the same probe again on a **macOS runner** with
+`--require-backend metal`: the probe fails rather than fall back if Metal is
+unavailable, and `verify_shader.py --require-backend metal` fails unless the
+report shows the modules were accepted on Metal. That makes "a real Metal driver
+accepts the lowered modules" a checked fact on the backend iOS actually uses.
+It runs against the packs the repository ships for this (`post-test`,
+`terrain-test`, `config-test`) and the run fails if any pack fails to open, any
+module fails to lower, or wgpu rejects a module.
 
 **Be precise about what that proves.** It proves the loader can discover, parse,
-translate, lower and hand packs to the renderer — the path a pack must survive to
-be applied. It does **not** prove a pack renders as its author intended on a
-phone: module acceptance on a software adapter is necessary but not sufficient.
+translate, lower and hand packs to the renderer, and that a real Metal driver
+accepts the lowered modules — the path a pack must survive to be applied. It does
+**not** prove a pack renders as its author intended on a phone: module acceptance
+is necessary but not sufficient, because it does not exercise the draw calls,
+framebuffer formats or per-frame state a phone uses.
 The repository's own iOS notes say third-party pack rendering is not established
 and needs a physical iPad; the probe's report says so too, and the validation
 report keeps that distinction. The shader-support question is answered honestly
@@ -124,4 +133,13 @@ tools/verify_package.py                     package/archive verification
 tools/verify_shader.py                      shader-support verdict
 tools/write_report.py                       assemble VALIDATION-REPORT.md
 tools/shader-probe/                         the headless shader probe (Rust)
+tools/tests/                                regression tests for the tools
 ```
+
+Run the tool tests locally with:
+
+```sh
+python3 -m unittest discover -s tools/tests -t .
+```
+
+CI runs the same command before the downloads, so a broken tool fails fast.
