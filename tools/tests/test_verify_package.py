@@ -6,6 +6,7 @@ marker, the wrong version, an archive whose entries are not under the top folder
 an archive whose root does not hold the marker, and an unsafe `..` entry.
 """
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -159,6 +160,128 @@ class Shaders(unittest.TestCase):
             zf.writestr("shaders/composite.fsh", "void main(){}")
         result = verify_package.check_shaders(self.root)
         self.assertTrue(result["ok"])
+
+
+class CoreShaders(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.shaders = self.root / "assets" / "minecraft" / "shaders"
+        (self.shaders / "include").mkdir(parents=True)
+        (self.shaders / "core").mkdir(parents=True)
+        (self.shaders / "include" / "projection.glsl").write_text("// proj\n")
+        (self.shaders / "include" / "globals.glsl").write_text("// globals\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_resolved_includes_pass(self):
+        (self.shaders / "core" / "terrain.vsh").write_text(
+            "#include <minecraft:projection.glsl>\n#include <minecraft:globals.glsl>\n"
+        )
+        result = verify_package.check_core_shaders(self.root)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["checked"], 3)  # the core file and both include files
+        self.assertEqual(result["includes"], 2)
+
+    def test_a_missing_include_fails(self):
+        (self.shaders / "core" / "terrain.vsh").write_text("#include <minecraft:missing.glsl>\n")
+        result = verify_package.check_core_shaders(self.root)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("missing.glsl" in p for p in result["problems"]))
+
+    def test_a_commented_out_include_is_ignored(self):
+        (self.shaders / "core" / "terrain.vsh").write_text(
+            "// #include <minecraft:missing.glsl>\n"
+            "/* #include <minecraft:also_missing.glsl> */\n"
+            "#include <minecraft:projection.glsl>\n"
+        )
+        result = verify_package.check_core_shaders(self.root)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["includes"], 1)
+
+    def test_a_relative_include_resolves_from_its_folder(self):
+        (self.shaders / "include" / "common.glsl").write_text('#include "globals.glsl"\n')
+        result = verify_package.check_core_shaders(self.root)
+        self.assertTrue(result["ok"], result["problems"])
+
+    def test_moj_import_is_recognised(self):
+        (self.shaders / "core" / "terrain.vsh").write_text("#moj_import <minecraft:missing.glsl>\n")
+        result = verify_package.check_core_shaders(self.root)
+        self.assertFalse(result["ok"])
+
+
+class JsonMetadata(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_valid_json_passes(self):
+        models = self.root / "assets" / "minecraft" / "models"
+        models.mkdir(parents=True)
+        (models / "block.json").write_text('{"parent": "block/cube"}')
+        (self.root / "assets" / "pack.mcmeta").write_text('{"pack": {"pack_format": 1}}')
+        result = verify_package.check_json_metadata(self.root)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["checked"], 2)
+
+    def test_a_malformed_file_fails(self):
+        (self.root / "data").mkdir()
+        (self.root / "data" / "tags.json").write_text('{"a": }')
+        result = verify_package.check_json_metadata(self.root)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("tags.json" in p for p in result["problems"]))
+
+    def test_a_non_json_file_is_ignored(self):
+        (self.root / "assets").mkdir()
+        (self.root / "assets" / "notes.txt").write_text("not json at all")
+        result = verify_package.check_json_metadata(self.root)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["checked"], 0)
+
+
+class MarkerHashes(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, name: str, data: bytes) -> str:
+        (self.root / name).write_bytes(data)
+        return hashlib.sha256(data).hexdigest()
+
+    def test_matching_hashes_pass(self):
+        digest = self._write("facts.json", b'{"a":1}')
+        result = verify_package.check_marker_hashes(self.root, {"facts_sha256": digest})
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["checked"], 1)
+
+    def test_a_changed_file_fails(self):
+        self._write("facts.json", b'{"a":1}')
+        result = verify_package.check_marker_hashes(self.root, {"facts_sha256": "0" * 64})
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("facts.json" in p for p in result["problems"]))
+
+    def test_a_missing_recorded_file_fails(self):
+        result = verify_package.check_marker_hashes(
+            self.root, {"health_files_sha256": {"damage-types.json": "0" * 64}}
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("damage-types.json" in p for p in result["problems"]))
+
+    def test_exporter_hashes_are_skipped(self):
+        # The exporter maps name Java sources the package does not carry; they must not
+        # be reported as missing files.
+        result = verify_package.check_marker_hashes(
+            self.root, {"facts_exporters_sha256": {"mods/x.java": "0" * 64}}
+        )
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["checked"], 0)
 
 
 class Main(unittest.TestCase):

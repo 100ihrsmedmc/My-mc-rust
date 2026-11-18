@@ -117,7 +117,13 @@ in `VALIDATION-REPORT.md`'s findings table, which marks on-device rendering
 ### Package and archive — `tools/verify_package.py`
 
 - the prepared tree's layout and schema (7) and the Minecraft version it claims;
-- the archive's integrity, entry count and that every tree file is in it.
+- the archive's integrity, entry count and that every tree file is in it;
+- that every `#include`/`#moj_import` the vanilla core shaders name resolves to a
+  file the package carries (`assets/<ns>/shaders/...`), so no core shader is left
+  uncompilable — the same resolution `horizon-client-render`'s `core_shader` does;
+- that every file `horizon-resources.json` records a SHA-256 for still matches it,
+  so a tree edited after preparation is caught;
+- that every JSON resource (`assets/**/*.json`, `data/**/*.json`, `*.mcmeta`) parses.
 
 ## Failure handling
 

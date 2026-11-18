@@ -137,6 +137,19 @@ def main() -> int:
     add(f"- Downloadable archive: {archive.get('entries', '?')} entries, {human_bytes(archive.get('bytes', 0))}")
     add(f"- Archive is what the phone imports (`horizon-client --pack-resources`): "
         f"{yes(archive.get('ok', False))}")
+    core = tree.get("core_shaders", {})
+    if core.get("checked"):
+        add(f"- Vanilla core shaders: {core.get('checked', '?')} files, "
+            f"{core.get('includes', '?')} `#include`/`#moj_import` directives, "
+            f"{len(core.get('problems', []))} unresolved")
+    marker = tree.get("marker_hashes", {})
+    if marker.get("checked"):
+        add(f"- Files matching the SHA-256 `horizon-resources.json` records: "
+            f"{marker.get('checked', '?')}")
+    meta = tree.get("json_metadata", {})
+    if meta.get("checked"):
+        add(f"- JSON resources parsed: {meta.get('checked', '?')} "
+            f"({len(meta.get('problems', []))} malformed)")
     add("")
     add("## Audio (OGG)")
     add("")

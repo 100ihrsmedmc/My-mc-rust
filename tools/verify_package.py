@@ -25,7 +25,9 @@ Exit status is 0 only when every check passes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -97,6 +99,24 @@ def check_tree(resources: Path, expected_version: str, expected_schema: int | No
         if not (resources / pack).is_file():
             result["warnings"].append(f"built-in pack {pack} is missing")
 
+    marker_hashes = check_marker_hashes(resources, data)
+    result["marker_hashes"] = marker_hashes
+    if not marker_hashes["ok"]:
+        result["ok"] = False
+        result["problems"].extend(marker_hashes["problems"])
+
+    core_shaders = check_core_shaders(resources)
+    result["core_shaders"] = core_shaders
+    if not core_shaders["ok"]:
+        result["ok"] = False
+        result["problems"].extend(core_shaders["problems"])
+
+    json_metadata = check_json_metadata(resources)
+    result["json_metadata"] = json_metadata
+    if not json_metadata["ok"]:
+        result["ok"] = False
+        result["problems"].extend(json_metadata["problems"])
+
     background = resources / "assets/minecraft/textures/gui/title/background"
     faces = [background / f"panorama_{i}.png" for i in range(6)]
     if not all(face.is_file() for face in faces) or not (background / "panorama_overlay.png").is_file():
@@ -114,6 +134,183 @@ def check_tree(resources: Path, expected_version: str, expected_schema: int | No
         result["warnings"].append(
             f"the tree is {size / 1e6:.1f} MB, above the {EXPECTED_MAX_BYTES / 1e6:.0f} MB expected"
         )
+    return result
+
+
+def _strip_comments(text: str) -> str:
+    """Comments as spaces, line breaks kept (mirrors the renderer's own stripper)."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if c == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and nxt == "*":
+            i += 2
+            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                if text[i] == "\n":
+                    out.append("\n")
+                i += 1
+            i += 2
+            out.append(" ")
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_INCLUDE = re.compile(r"#\s*(?:include|moj_import)\s+(<[^>]+>|\"[^\"]+\")")
+
+
+def _include_target(target: str, folder: str) -> str | None:
+    """The resource path an include names, or None when it cannot be read.
+
+    Mirrors `core_shader::include_id`: `<ns:path>` (or `<path>`) is under
+    `shaders/include`; `"path"` is relative to the including file's folder.
+    """
+    if target.startswith("<") and target.endswith(">"):
+        inner = target[1:-1]
+        ns, _, path = inner.partition(":")
+        if not path:
+            ns, path = "minecraft", inner
+        return f"assets/{ns}/shaders/include/{path}"
+    if target.startswith('"') and target.endswith('"'):
+        relative = target[1:-1]
+        ns, _, base = folder.partition(":")
+        parts = [p for p in base.split("/") if p]
+        for part in relative.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not parts:
+                    return None
+                parts.pop()
+            else:
+                parts.append(part)
+        return f"assets/{ns}/{'/'.join(parts)}"
+    return None
+
+
+def check_core_shaders(resources: Path) -> dict:
+    """Whether the vanilla core shaders the renderer compiles have their includes.
+
+    The game reads `assets/<ns>/shaders/core/*.vsh|.fsh` and inlines every
+    `#include`/`#moj_import` it names (`horizon-client-render/src/core_shader.rs`).
+    An include the package does not carry is a core shader the renderer cannot
+    compile, so it is checked here rather than discovered at run time.
+    """
+    result: dict = {"ok": True, "problems": [], "checked": 0, "includes": 0}
+    assets = resources / "assets"
+    if not assets.is_dir():
+        return result
+    core_files = [
+        p
+        for p in assets.glob("*/shaders/**/*")
+        if p.is_file() and p.suffix in (".vsh", ".fsh", ".glsl")
+    ]
+    result["checked"] = len(core_files)
+    for path in sorted(core_files):
+        rel = path.relative_to(resources).as_posix()
+        # The renderer addresses includes by `<ns>:<path under assets>`; a `"relative"`
+        # include is resolved against the including file's folder, as `core_shader` does.
+        after_assets = path.relative_to(assets).as_posix()
+        ns, _, rest = after_assets.partition("/")
+        folder = f"{ns}:{rest.rsplit('/', 1)[0]}"
+        try:
+            text = path.read_text(errors="replace")
+        except OSError as error:
+            result["ok"] = False
+            result["problems"].append(f"{rel} could not be read: {error}")
+            continue
+        for target in _INCLUDE.findall(_strip_comments(text)):
+            result["includes"] += 1
+            resolved = _include_target(target, folder)
+            if resolved is None or not (resources / resolved).is_file():
+                result["ok"] = False
+                result["problems"].append(
+                    f"{rel} includes {target} which the package does not carry"
+                )
+    return result
+
+
+def check_json_metadata(resources: Path) -> dict:
+    """Whether every JSON resource the package carries parses.
+
+    Models, blockstates, lang files, `pack.mcmeta` and the rest are JSON the game
+    parses at load; one malformed file is a resource that fails to load. Only the
+    parse is checked here (the schemas are the game's business), and a bounded
+    sample of the failures is reported.
+    """
+    result: dict = {"ok": True, "problems": [], "checked": 0}
+    for folder in ("assets", "data"):
+        base = resources / folder
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix not in (".json", ".mcmeta"):
+                continue
+            result["checked"] += 1
+            try:
+                json.loads(path.read_bytes())
+            except ValueError as error:
+                result["ok"] = False
+                if len(result["problems"]) < 20:
+                    result["problems"].append(
+                        f"{path.relative_to(resources).as_posix()} is not valid JSON: {error}"
+                    )
+    if not result["ok"]:
+        result["problems"].append("more malformed JSON files were not listed")
+    return result
+
+
+def check_marker_hashes(resources: Path, data: dict) -> dict:
+    """Whether the files the marker records a SHA-256 for still match it.
+
+    `horizon-resources.json` names the exports it was built from and their
+    hashes (`facts_sha256`, `model_states_sha256`, the `*_files_sha256` maps).
+    A file that no longer matches means the tree was edited after preparation, so
+    it is checked here. The `*_exporters_sha256` maps name the Java exporters the
+    files came from, which the package does not carry; those are skipped, not failed.
+    """
+    result: dict = {"ok": True, "problems": [], "checked": 0}
+    named: dict[str, str] = {}
+    for key, value in data.items():
+        if not key.endswith("_sha256"):
+            continue
+        if isinstance(value, dict) and key.endswith("_files_sha256"):
+            # These maps name each file they cover.
+            for rel, digest in value.items():
+                named[rel] = digest
+        elif isinstance(value, str):
+            # A scalar hash covers the file whose name is the key's stem; the exports
+            # use hyphens where the key uses underscores (`model_states` -> `model-states`).
+            stem = key[: -len("_sha256")]
+            for base in (stem, stem.replace("_", "-")):
+                found = next(
+                    (c for c in (f"{base}.json", f"{base}.nbt", f"cached-{base}.nbt")
+                     if (resources / c).is_file()),
+                    None,
+                )
+                if found:
+                    named[found] = value
+                    break
+    for rel, digest in sorted(named.items()):
+        path = resources / rel
+        if not path.is_file():
+            result["ok"] = False
+            result["problems"].append(f"{rel} is recorded in {MARKER} but missing")
+            continue
+        result["checked"] += 1
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != digest:
+            result["ok"] = False
+            result["problems"].append(
+                f"{rel} does not match the hash {MARKER} records (edited after preparation)"
+            )
     return result
 
 
@@ -234,6 +431,17 @@ def main() -> int:
     tree = report["tree"]
     print(f"Tree: {tree.get('files', 0)} files, {tree.get('bytes', 0) / 1e6:.1f} MB, "
           f"schema {tree.get('schema')}, Minecraft {tree.get('minecraft')!r}")
+    core = tree.get("core_shaders", {})
+    if core.get("checked"):
+        print(f"Core shaders: {core.get('checked', 0)} files, "
+              f"{core.get('includes', 0)} includes, {len(core.get('problems', []))} unresolved")
+    marker = tree.get("marker_hashes", {})
+    if marker.get("checked"):
+        print(f"Marker hashes: {marker.get('checked', 0)} files verified")
+    meta = tree.get("json_metadata", {})
+    if meta.get("checked"):
+        print(f"JSON metadata: {meta.get('checked', 0)} files parsed, "
+              f"{len(meta.get('problems', []))} malformed")
     arch = report["archive_checks"]
     print(f"Archive: {arch.get('entries', 0)} entries, {arch.get('bytes', 0) / 1e6:.1f} MB")
     print(f"Shaders: {len(report['shaders']['packs'])} pack(s) found")
