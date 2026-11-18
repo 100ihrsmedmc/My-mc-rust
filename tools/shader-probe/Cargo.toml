@@ -1,0 +1,32 @@
+[package]
+name = "horizon-shader-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Headless verification that Horizon's Iris/OptiFine shader-pack path discovers, opens, preprocesses, translates and lowers packs to the backends the iOS build uses (Metal/MSL)"
+
+# A standalone crate, not a member of the game workspace: CI builds it with
+#   cargo build --release --manifest-path tools/shader-probe/Cargo.toml
+# from the Horizon checkout, and never edits the game's Cargo.toml.
+#
+# Run it with:
+#   cargo run --release --manifest-path tools/shader-probe/Cargo.toml -- --dir <folder-of-packs>
+#   cargo run --release --manifest-path tools/shader-probe/Cargo.toml -- <pack-folder-or-zip>...
+# It writes a JSON report with --report PATH and prints a summary. No GPU is
+# touched: everything is discovery, parsing and naga lowering, which is exactly
+# what decides whether the loader can hand a pack to the renderer.
+
+[dependencies]
+horizon-shaders = { path = "../../crates/horizon-shaders" }
+naga = { version = "30.0.1", features = ["glsl-in", "wgsl-in", "spv-out", "hlsl-out", "glsl-out", "msl-out"] }
+serde_json = "1"
+
+# Use the same naga the game uses. The game's workspace patches crates.io naga
+# with its own copy (`third_party/naga`), which carries the GLSL frontend fixes
+# shader packs need; without this patch the probe would translate with a
+# different frontend and its verdict would not be the game's.
+[patch.crates-io]
+naga = { path = "../../third_party/naga" }
+
+[workspace]

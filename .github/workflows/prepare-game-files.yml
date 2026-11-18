@@ -1,0 +1,292 @@
+name: Prepare Horizon resources
+
+# Builds the resource package Horizon iOS needs for Minecraft: Java Edition 26.3,
+# verifies its audio and shader-related components, and uploads it as the
+# `horizon-resources` artifact. See README.md for what it does and does not prove.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: Horizon iOS source repository to build the preparer from
+        required: true
+        default: datlun2k11-pixel/a-bit-better-horizon-ios
+      source_ref:
+        description: Source revision (branch, tag or commit)
+        required: true
+        default: main
+      verify_shaders:
+        description: Build the headless shader probe and verify the shader-pack path
+        type: boolean
+        required: true
+        default: true
+
+# The runner only reads this repository and the public source repository, and
+# only ever downloads from Mojang's official hosts. No secrets are used.
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-horizon-resources-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the game's own paths out of the runner's home; nothing here touches a real profile.
+  HORIZON_HOME: ${{ github.workspace }}/horizon-home
+  RUST_BACKTRACE: "1"
+
+jobs:
+  prepare:
+    name: Prepare and verify resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.lock.outputs.version }}
+      java_major: ${{ steps.lock.outputs.java_major }}
+      archive_sha256: ${{ steps.archive.outputs.sha256 }}
+
+    steps:
+      - name: Check out this repository (the tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: Check out the Horizon iOS source
+        id: source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          path: horizon
+
+      - name: Report disk and tool versions
+        run: |
+          set -euo pipefail
+          df -h /
+          python3 --version
+          rustc --version || true
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          # The runners ship large toolchains this job does not use.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install system build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libasound2-dev libudev-dev libcap-dev \
+            zip unzip file
+
+      - name: Install the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Read the pinned version from the lock
+        id: lock
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          lock = json.loads(pathlib.Path("horizon/research-lock.json").read_text())
+          mc = lock["minecraft"]
+          print(f"version={mc['version']}")
+          print(f"java_major={mc.get('java_major', 25)}")
+          print(f"manifest_sha1={mc['manifest_sha1']}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Fetch the pinned Minecraft files from Mojang
+        run: |
+          set -euo pipefail
+          python3 tooling/tools/fetch_minecraft.py \
+            --lock horizon/research-lock.json \
+            --minecraft-dir "$RUNNER_TEMP/minecraft" \
+            --server-jar "$RUNNER_TEMP/server.jar" \
+            --jobs 16
+
+      - name: Resolve the asset index path
+        id: assets
+        run: |
+          set -euo pipefail
+          # The index id (e.g. `34`) is not the version, so read it from the version JSON
+          # Mojang served. The asset index is the source of truth for the audio checks.
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          version = "${{ steps.lock.outputs.version }}"
+          manifest = json.loads(
+              pathlib.Path(f"$RUNNER_TEMP/minecraft/versions/{version}/{version}.json").read_text()
+          )
+          index = f"$RUNNER_TEMP/minecraft/assets/indexes/{manifest['assetIndex']['id']}.json"
+          assert pathlib.Path(index).is_file(), f"asset index missing: {index}"
+          print(f"asset_index={index}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Fetch the pinned Java runtime (Temurin)
+        id: jdk
+        run: |
+          set -euo pipefail
+          JAVA_HOME=$(python3 tooling/tools/fetch_jdk.py \
+            --major "${{ steps.lock.outputs.java_major }}" \
+            --dest "$RUNNER_TEMP/jdk" | tail -1)
+          echo "java_home=$JAVA_HOME" >> "$GITHUB_OUTPUT"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          "$JAVA_HOME/bin/java" -version
+
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            horizon/target
+          key: horizon-${{ runner.os }}-${{ hashFiles('horizon/Cargo.lock') }}
+          restore-keys: horizon-${{ runner.os }}-
+
+      - name: Build horizon-prepare and horizon-client
+        run: |
+          set -euo pipefail
+          cd horizon
+          cargo build --release -p horizon-prepare -p horizon-client
+
+      - name: Prepare the resources (horizon-prepare --complete)
+        run: |
+          set -euo pipefail
+          cd horizon
+          ./target/release/horizon-prepare --complete \
+            --server-jar "$RUNNER_TEMP/server.jar" \
+            --minecraft-dir "$RUNNER_TEMP/minecraft" \
+            --java-home "${{ steps.jdk.outputs.java_home }}" \
+            --root "$PWD" \
+            --output "$RUNNER_TEMP/resources"
+
+      - name: Confirm the resources are complete and current
+        run: |
+          set -euo pipefail
+          cd horizon
+          ./target/release/horizon-prepare --check --root "$PWD" --output "$RUNNER_TEMP/resources"
+
+      - name: Pack the archive the phone imports
+        id: archive
+        run: |
+          set -euo pipefail
+          cd horizon
+          mkdir -p "$RUNNER_TEMP/dist"
+          ./target/release/horizon-client \
+            --pack-resources "$RUNNER_TEMP/resources" \
+            --out "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip"
+          ls -l "$RUNNER_TEMP/dist"
+          sha256sum "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip" | tee "$RUNNER_TEMP/dist/SHA256SUMS.txt"
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify audio (OGG)
+        run: |
+          set -euo pipefail
+          python3 tooling/tools/verify_ogg.py \
+            --resources "$RUNNER_TEMP/resources" \
+            --asset-index "${{ steps.assets.outputs.asset_index }}" \
+            --report "$RUNNER_TEMP/reports/audio-report.json"
+
+      - name: Verify the package and archive structure
+        run: |
+          set -euo pipefail
+          python3 tooling/tools/verify_package.py \
+            --resources "$RUNNER_TEMP/resources" \
+            --archive "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip" \
+            --version "${{ steps.lock.outputs.version }}" \
+            --report "$RUNNER_TEMP/reports/package-report.json"
+
+      - name: Build the headless shader probe
+        if: ${{ inputs.verify_shaders }}
+        run: |
+          set -euo pipefail
+          # The probe links the game's `horizon-shaders` crate by a relative path, so it
+          # is built from inside the checkout. It is its own workspace and never edits
+          # the game's Cargo.toml.
+          rm -rf horizon/tools/shader-probe
+          cp -r tooling/tools/shader-probe horizon/tools/shader-probe
+          cargo build --release \
+            --manifest-path horizon/tools/shader-probe/Cargo.toml \
+            --target-dir "$RUNNER_TEMP/probe-target"
+
+      - name: Verify the shader-pack path
+        if: ${{ inputs.verify_shaders }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/reports"
+          "$RUNNER_TEMP/probe-target/release/horizon-shader-probe" \
+            --dir horizon/crates/horizon-shaders/tests/packs \
+            --report "$RUNNER_TEMP/reports/shader-report.json"
+          python3 tooling/tools/verify_shader.py \
+            --report "$RUNNER_TEMP/reports/shader-report.json" \
+            --write "$RUNNER_TEMP/reports/shader-findings.json" \
+            --expect-pack post-test \
+            --expect-pack terrain-test
+
+      - name: Write the validation report
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/reports"
+          cat > "$RUNNER_TEMP/reports/meta.json" <<JSON
+          {
+            "version": "${{ steps.lock.outputs.version }}",
+            "source_repo": "${{ inputs.source_repo }}",
+            "source_commit": "${{ steps.source.outputs.commit }}",
+            "mojang_hosts": "piston-meta.mojang.com, libraries.minecraft.net, resources.download.minecraft.net"
+          }
+          JSON
+          # A skipped shader job leaves no report; the report then says so instead of claiming success.
+          test -f "$RUNNER_TEMP/reports/shader-report.json" || echo '{}' > "$RUNNER_TEMP/reports/shader-report.json"
+          test -f "$RUNNER_TEMP/reports/shader-findings.json" || echo '{}' > "$RUNNER_TEMP/reports/shader-findings.json"
+          python3 tooling/tools/write_report.py \
+            --audio "$RUNNER_TEMP/reports/audio-report.json" \
+            --package "$RUNNER_TEMP/reports/package-report.json" \
+            --shader "$RUNNER_TEMP/reports/shader-report.json" \
+            --shader-findings "$RUNNER_TEMP/reports/shader-findings.json" \
+            --meta "$RUNNER_TEMP/reports/meta.json" \
+            --out "$RUNNER_TEMP/dist/VALIDATION-REPORT.md"
+          cat "$RUNNER_TEMP/dist/VALIDATION-REPORT.md"
+
+      - name: Assemble the artifact
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/artifact"
+          cp "$RUNNER_TEMP/dist/${{ steps.lock.outputs.version }}.zip" "$RUNNER_TEMP/artifact/"
+          cp "$RUNNER_TEMP/dist/SHA256SUMS.txt" "$RUNNER_TEMP/artifact/"
+          cp "$RUNNER_TEMP/dist/VALIDATION-REPORT.md" "$RUNNER_TEMP/artifact/"
+          mkdir -p "$RUNNER_TEMP/artifact/reports"
+          cp "$RUNNER_TEMP/reports/"*.json "$RUNNER_TEMP/artifact/reports/"
+          # Guard: the artifact must never carry anything but the package and its reports.
+          if find "$RUNNER_TEMP/artifact" -name '*.jar' -o -name '*.env' -o -name 'session*' | grep -q .; then
+            echo "unexpected file in the artifact" >&2; exit 1
+          fi
+          find "$RUNNER_TEMP/artifact" -type f -printf '%s\t%p\n' | sort -n
+
+      - name: Upload the resource package
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-resources
+          path: ${{ runner.temp }}/artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarise
+        run: |
+          set -euo pipefail
+          {
+            echo "## Horizon resources for Minecraft ${{ steps.lock.outputs.version }}"
+            echo
+            echo "- Archive: \`${{ steps.lock.outputs.version }}.zip\`"
+            echo "- SHA-256: \`${{ steps.archive.outputs.sha256 }}\`"
+            echo
+            echo "Artifact: **horizon-resources** (contains the archive, its SHA-256 and the validation report)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/dist/VALIDATION-REPORT.md" >> "$GITHUB_STEP_SUMMARY"
