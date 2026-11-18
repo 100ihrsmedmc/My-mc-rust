@@ -20,6 +20,14 @@ on:
         type: boolean
         required: true
         default: true
+      verify_metal:
+        description: >-
+          Also run the shader probe on a macOS runner and require the real Metal
+          backend. Needs a GitHub-hosted macOS runner, which not every account can
+          provision; leave off if the runner stays queued or is rejected.
+        type: boolean
+        required: true
+        default: false
 
 # The runner only reads this repository and the public source repository, and
 # only ever downloads from Mojang's official hosts. No secrets are used.
@@ -325,11 +333,16 @@ jobs:
   # prove a real Metal driver accepts the modules. This job runs the same probe on
   # a macOS runner, requires the Metal backend, and fails unless the modules are
   # accepted there -- so "Metal works" is a checked fact, not an assumption.
+  #
+  # Off by default (input `verify_metal`) because GitHub-hosted macOS runners are
+  # not available to every account: on an account without them this job is either
+  # rejected outright or left queued, which would fail the whole run. Turn it on
+  # when the account can provision `macos-14`.
   metal:
     name: Verify the shader path on Metal
     runs-on: macos-14
     timeout-minutes: 45
-    if: ${{ inputs.verify_shaders }}
+    if: ${{ inputs.verify_shaders && inputs.verify_metal }}
     steps:
       - name: Check out this repository (the tooling)
         uses: actions/checkout@v4

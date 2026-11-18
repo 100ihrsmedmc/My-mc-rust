@@ -14,11 +14,14 @@ The package is ~400 MB and is what the phone imports on first run.
    - `source_repo` — the Horizon iOS source to build the preparer from
      (default `datlun2k11-pixel/a-bit-better-horizon-ios`),
    - `source_ref` — its branch, tag or commit (default `main`),
-   - `verify_shaders` — build and run the headless shader probe (default on).
-4. Wait for the two jobs to finish (roughly 20–45 minutes: the Rust build
-   dominates, then the resource preparation, packing and checks). `prepare`
-   builds and verifies the package on Linux; `metal` runs the shader probe again
-   on a macOS runner and requires the real Metal backend. Both must be green.
+   - `verify_shaders` — build and run the headless shader probe (default on),
+   - `verify_metal` — also run the probe on a macOS runner and require the real
+     Metal backend (default off; needs a GitHub-hosted macOS runner).
+4. Wait for the job to finish (roughly 20–40 minutes: the Rust build dominates,
+   then the resource preparation, packing and checks). There is a second,
+   optional job `metal` that re-runs the shader probe on a macOS runner and
+   requires the real Metal backend; it is **off by default** because not every
+   account can provision a GitHub-hosted macOS runner (see "Shaders" below).
 
 Command line, if you prefer:
 
@@ -92,6 +95,9 @@ The workflow then runs the same probe again on a **macOS runner** with
 unavailable, and `verify_shader.py --require-backend metal` fails unless the
 report shows the modules were accepted on Metal. That makes "a real Metal driver
 accepts the lowered modules" a checked fact on the backend iOS actually uses.
+This macOS job is gated on the `verify_metal` input (default off) because
+GitHub-hosted macOS runners are not available to every account; turn it on when
+the account can provision `macos-14`.
 It runs against the packs the repository ships for this (`post-test`,
 `terrain-test`, `config-test`) and the run fails if any pack fails to open, any
 module fails to lower, or wgpu rejects a module.
