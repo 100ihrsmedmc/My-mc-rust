@@ -114,18 +114,21 @@ jobs:
 
       - name: Resolve the asset index path
         id: assets
+        env:
+          MC_VERSION: ${{ steps.lock.outputs.version }}
         run: |
           set -euo pipefail
           # The index id (e.g. `34`) is not the version, so read it from the version JSON
           # Mojang served. The asset index is the source of truth for the audio checks.
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, pathlib
-          version = "${{ steps.lock.outputs.version }}"
+          import json, os, pathlib
+          minecraft = pathlib.Path(os.environ["RUNNER_TEMP"]) / "minecraft"
+          version = os.environ["MC_VERSION"]
           manifest = json.loads(
-              pathlib.Path(f"$RUNNER_TEMP/minecraft/versions/{version}/{version}.json").read_text()
+              (minecraft / "versions" / version / f"{version}.json").read_text()
           )
-          index = f"$RUNNER_TEMP/minecraft/assets/indexes/{manifest['assetIndex']['id']}.json"
-          assert pathlib.Path(index).is_file(), f"asset index missing: {index}"
+          index = minecraft / "assets" / "indexes" / f"{manifest['assetIndex']['id']}.json"
+          assert index.is_file(), f"asset index missing: {index}"
           print(f"asset_index={index}")
           PY
           cat "$GITHUB_OUTPUT"
