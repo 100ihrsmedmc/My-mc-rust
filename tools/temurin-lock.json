@@ -1,0 +1,19 @@
+{
+  "vendor": "eclipse",
+  "release_name": "jdk-25.0.5+8",
+  "java_version": "25.0.5+8-LTS",
+  "major": 25,
+  "note": "Pinned Temurin (Eclipse Adoptium) build for linux. Every field here is fixed; the fetch verifies the archive's SHA-256 against the checksum below before it is unpacked. To update: read the release from https://api.adoptium.net/v3/assets/latest/<major>/hotspot?architecture=x64&image_type=jdk&os=linux&vendor=eclipse (and the same with architecture=aarch64), then replace release_name, java_version and each arch's url/sha256/size with the new release's package link, checksum and size. Never point this at a mutable 'latest' URL.",
+  "platforms": {
+    "x64": {
+      "url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz",
+      "sha256": "68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb",
+      "size": 141341188
+    },
+    "aarch64": {
+      "url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz",
+      "sha256": "bb5b2ded252f21c6090cf780b0a408ad0d83bbb557e702955643557f13231880",
+      "size": 140178170
+    }
+  }
+}

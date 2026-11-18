@@ -19,9 +19,13 @@ check passes.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
+import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -141,6 +145,44 @@ def parse_codec(first_payload: bytes) -> dict:
     raise OggError("first page is not a Vorbis or Opus identification header")
 
 
+# --- Vorbis decoding ---------------------------------------------------------
+
+
+def is_vorbis(path: Path) -> bool:
+    """Whether the file's first packet is a Vorbis identification header.
+
+    Used to pick the files for the decode stage: a non-Vorbis file is already
+    reported by the container/codec checks, and ffmpeg would only repeat it.
+    """
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(64)
+    except OSError:
+        return False
+    return header[28:35] == b"\x01vorbis"
+
+
+def decode_vorbis(ffmpeg: str, path: Path, timeout: int = 120) -> tuple[bool, str]:
+    """Fully decode one Ogg Vorbis file, samples discarded.
+
+    Returns `(ok, error)`. The container checks above prove the pages are intact;
+    this proves the Vorbis stream inside them actually decodes -- a truncated or
+    malformed stream whose last page is missing, or whose packets are corrupt, is
+    caught here and nowhere else. `-xerror` makes ffmpeg stop at the first decode
+    error instead of logging and continuing, and `-f null` writes no output.
+    """
+    result = subprocess.run(
+        [ffmpeg, "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip().splitlines()
+        return False, message[0] if message else f"ffmpeg exited {result.returncode}"
+    return True, ""
+
+
 # --- sounds.json -------------------------------------------------------------
 
 
@@ -183,6 +225,12 @@ def main() -> int:
     parser.add_argument("--asset-index", type=Path,
                         help="the Minecraft asset index JSON (proves byte preservation)")
     parser.add_argument("--report", type=Path, required=True, help="where to write the JSON report")
+    parser.add_argument("--ffmpeg", default=None,
+                        help="path to ffmpeg (default: find it on PATH); needed for the Vorbis decode stage")
+    parser.add_argument("--no-decode", action="store_true",
+                        help="skip the full Vorbis decode stage (structure checks only)")
+    parser.add_argument("--decode-jobs", type=int, default=0,
+                        help="parallel ffmpeg decoders (0 = one per CPU, capped at 8)")
     parser.add_argument("--sample-limit", type=int, default=50,
                         help="how many examples of each problem to keep")
     args = parser.parse_args()
@@ -192,6 +240,7 @@ def main() -> int:
     report: dict = {
         "resources": str(resources),
         "ogg": {"count": 0, "bytes": 0, "failed": 0, "failures": [], "codecs": {}},
+        "decode": {"ran": False, "tool": None, "decoded": 0, "failed": 0, "failures": []},
         "structure": {"ok": True, "problems": []},
         "sounds_json": {"present": False, "events": 0, "referenced_files": 0,
                         "missing_files": [], "malformed": False},
@@ -238,6 +287,37 @@ def main() -> int:
             report["ogg"]["failed"] += 1
             if len(report["ogg"]["failures"]) < sample_limit:
                 report["ogg"]["failures"].append({"file": relative, "error": str(error)})
+
+    # Full Vorbis decode: prove every stream actually decodes, not just that its
+    # container pages are intact. A truncated tail or a corrupt packet is caught here.
+    if not args.no_decode:
+        ffmpeg = args.ffmpeg or shutil.which("ffmpeg")
+        # A named path that is not an executable is as unusable as a missing one: say
+        # so and leave `ran` false, so the run cannot pass on a decode that never ran.
+        if not (ffmpeg and os.path.isfile(ffmpeg) and os.access(ffmpeg, os.X_OK)):
+            report["decode"]["error"] = f"ffmpeg is not usable: {ffmpeg!r}"
+        else:
+            report["decode"]["ran"] = True
+            report["decode"]["tool"] = ffmpeg
+            # Only the streams that parsed as Vorbis: an Opus or broken file is
+            # already counted in `ogg.failed`, and ffmpeg would only repeat that.
+            vorbis = [path for path in oggs if path.suffix == ".ogg" and is_vorbis(path)]
+            jobs = args.decode_jobs or min(8, os.cpu_count() or 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+                futures = {pool.submit(decode_vorbis, ffmpeg, path): path for path in vorbis}
+                for future in concurrent.futures.as_completed(futures):
+                    path = futures[future]
+                    relative = path.relative_to(assets).as_posix()
+                    try:
+                        ok, error = future.result()
+                    except (subprocess.SubprocessError, OSError) as error_:  # noqa: BLE001
+                        ok, error = False, str(error_)
+                    if ok:
+                        report["decode"]["decoded"] += 1
+                    else:
+                        report["decode"]["failed"] += 1
+                        if len(report["decode"]["failures"]) < sample_limit:
+                            report["decode"]["failures"].append({"file": relative, "error": error})
 
     # sounds.json: the events and every file they name.
     sounds_json_path = assets / "minecraft" / "sounds.json"
@@ -298,6 +378,13 @@ def main() -> int:
         and (not report["asset_index"]["checked"] or (
             not report["asset_index"]["missing"] and not report["asset_index"]["mismatched"]))
     )
+    # The decode stage is required unless explicitly turned off: a run that could not
+    # decode every stream is not a pass, and a run that skipped decoding says so.
+    if not args.no_decode:
+        if not report["decode"]["ran"]:
+            ok = False
+        elif report["decode"]["failed"]:
+            ok = False
     report["ok"] = ok
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2))
@@ -308,6 +395,16 @@ def main() -> int:
     if report["ogg"]["failures"]:
         for failure in report["ogg"]["failures"][:10]:
             print(f"  {failure['file']}: {failure['error']}")
+    dec = report["decode"]
+    if args.no_decode:
+        print("Vorbis decode: SKIPPED (--no-decode)")
+    elif dec["ran"]:
+        print(f"Vorbis decode: {dec['decoded']} decoded, {dec['failed']} failed "
+              f"({dec['tool']})")
+        for failure in dec["failures"][:10]:
+            print(f"  {failure['file']}: {failure['error']}")
+    else:
+        print(f"Vorbis decode: NOT RUN ({dec.get('error', 'no ffmpeg')})")
     if not report["structure"]["ok"]:
         print("Structure problems:")
         for problem in report["structure"]["problems"][:10]:

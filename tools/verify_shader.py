@@ -105,7 +105,7 @@ def verdict_label(status: str) -> str:
     return {"verified": "PASS (loader level)", "unverified": "NOT VERIFIED", "limited": "LIMITED"}[status]
 
 
-def summarise(report: dict, expected: list[str]) -> int:
+def summarise(report: dict, expected: list[str], expect_config: bool = False) -> int:
     packs = report.get("packs", [])
     failures = report.get("failures", [])
     problems: list[str] = []
@@ -130,6 +130,8 @@ def summarise(report: dict, expected: list[str]) -> int:
     print(f"Packs discovered: {len(packs)}")
     total_modules = 0
     total_lowers = 0
+    diag_errors = 0
+    diag_warnings = 0
     for pack in packs:
         name = pack.get("name") or pack.get("path")
         if not pack.get("opened", True):
@@ -141,15 +143,44 @@ def summarise(report: dict, expected: list[str]) -> int:
         gpu = pack.get("gpu_failures", [])
         total_modules += modules
         total_lowers += modules * 4
-        state = "ok" if pack.get("applies") and not backends and not gpu else "FAILED"
+        # Every note the loader recorded, classified. A skipped program is fatal; the
+        # rest are kept and counted, never dropped.
+        notes = pack.get("notes", [])
+        skipped = [n for n in notes if n.get("severity") == "error"]
+        diag_errors += len(skipped) + pack.get("preprocess_diagnostics", 0)
+        diag_warnings += len(notes) - len(skipped) + pack.get("preprocess_warnings", 0)
+        state = "ok" if pack.get("applies") and not backends and not gpu and not skipped else "FAILED"
         print(
             f"  {name}: {pack.get('stage_files', 0)} stage files, {modules} modules, "
-            f"{len(backends)} backend failures, {len(gpu)} wgpu rejections -> {state}"
+            f"{len(backends)} backend failures, {len(gpu)} wgpu rejections, "
+            f"{len(skipped)} skipped programs, "
+            f"{pack.get('preprocess_diagnostics', 0)} preprocess diagnostics -> {state}"
         )
         for line in backends[:5]:
             problems.append(f"{name}: {line}")
         for line in gpu[:5]:
             problems.append(f"{name}: wgpu rejected: {line}")
+        for note in skipped[:5]:
+            problems.append(f"{name}: program skipped: {note.get('note')}")
+        # The pack's options, screens and profiles are the loader's own readers; report
+        # their counts as the evidence behind the "configuration preserved" finding.
+        opts = pack.get("options", {})
+        screens = pack.get("screens", {})
+        profiles = pack.get("profiles", {})
+        print(
+            f"      config: {opts.get('count', 0)} options, {screens.get('count', 0)} screens, "
+            f"{profiles.get('count', 0)} profiles, {pack.get('shaders_properties_keys', 0)} properties keys"
+        )
+        if not pack.get("config_read", True):
+            problems.append(f"{name}: options/screens/profiles were not read")
+        if pack.get("preprocess_diagnostics_detail"):
+            for d in pack["preprocess_diagnostics_detail"][:5]:
+                print(f"      diagnostic: {d.get('file')}:{d.get('line')}: {d.get('message')}")
+        for note in notes[:5]:
+            if note.get("severity") != "error":
+                print(f"      note: {note.get('note')}")
+
+    print(f"Diagnostics: {diag_errors} error-level, {diag_warnings} warning/info-level")
 
     for line in failures:
         problems.append(line)
@@ -160,6 +191,37 @@ def summarise(report: dict, expected: list[str]) -> int:
     for want in expected:
         if not any((p.get("name") or "") == want or want in (p.get("path") or "") for p in packs):
             problems.append(f"expected pack {want!r} was not discovered")
+
+    # `--expect-config` turns the "configuration and pack metadata preserved" finding
+    # into a checked fact: at least one pack must have produced a non-zero number of
+    # options, screens and profiles through the loader's own readers. A report where
+    # those are all zero cannot support that claim.
+    if expect_config:
+        richest = max(
+            packs,
+            key=lambda p: (
+                p.get("options", {}).get("count", 0)
+                + p.get("screens", {}).get("count", 0)
+                + p.get("profiles", {}).get("count", 0)
+            ),
+            default={},
+        )
+        counts = (
+            richest.get("options", {}).get("count", 0),
+            richest.get("screens", {}).get("count", 0),
+            richest.get("profiles", {}).get("count", 0),
+        )
+        if not all(count > 0 for count in counts):
+            problems.append(
+                "--expect-config was given but no pack produced non-zero options, screens and "
+                f"profiles (best pack: {richest.get('name')!r}: "
+                f"{counts[0]} options, {counts[1]} screens, {counts[2]} profiles)"
+            )
+        else:
+            print(
+                f"Configuration read: {richest.get('name')} -> "
+                f"{counts[0]} options, {counts[1]} screens, {counts[2]} profiles"
+            )
 
     print(f"Modules lowered: {total_modules} across 4 backends ({total_lowers} lowers)")
 
@@ -200,13 +262,18 @@ def main() -> int:
         default=[],
         help="a pack name that must have been discovered (repeatable)",
     )
+    parser.add_argument(
+        "--expect-config",
+        action="store_true",
+        help="require that at least one pack produced non-zero options, screens and profiles",
+    )
     args = parser.parse_args()
 
     if not args.report.is_file():
         print(f"error: {args.report} is missing: run the probe first", file=sys.stderr)
         return 1
     report = json.loads(args.report.read_text())
-    status = summarise(report, args.expect_pack)
+    status = summarise(report, args.expect_pack, args.expect_config)
 
     if args.write:
         args.write.parent.mkdir(parents=True, exist_ok=True)

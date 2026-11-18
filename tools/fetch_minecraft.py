@@ -113,12 +113,74 @@ def load_lock(lock_path: Path) -> dict:
     return minecraft
 
 
+def enumerate_plan(lock: dict) -> dict:
+    """What a real run would fetch, reading only Mojang's small metadata.
+
+    Fetches the pinned version JSON and the asset index -- both metadata on
+    `piston-meta`, neither a game archive nor an asset object -- and nothing else.
+    Writes nothing. Raises when the metadata does not match the lock.
+    """
+    version = lock["version"]
+    manifest_url = f"{PISTON_META}/v1/packages/{lock['manifest_sha1']}/{version}.json"
+    manifest_bytes = _fetch_bytes(manifest_url)
+    actual = hashlib.sha1(manifest_bytes).hexdigest()
+    if actual != lock["manifest_sha1"]:
+        raise SystemExit(
+            f"the pinned version JSON hashes to {actual}, not {lock['manifest_sha1']}"
+        )
+    manifest = json.loads(manifest_bytes)
+    if manifest.get("id") != version:
+        raise SystemExit(f"the pinned version JSON is for {manifest.get('id')!r}, not {version!r}")
+    if manifest.get("downloads", {}).get("client", {}).get("sha1") != lock["client_sha1"]:
+        raise SystemExit("the pinned version JSON's client jar does not match the lock")
+    if manifest.get("downloads", {}).get("server", {}).get("sha1") != lock["server_sha1"]:
+        raise SystemExit("the pinned version JSON's server jar does not match the lock")
+
+    libraries = [
+        library["downloads"]["artifact"]
+        for library in manifest.get("libraries", [])
+        if (library.get("downloads") or {}).get("artifact")
+        and all((library["downloads"]["artifact"].get(k) for k in ("path", "url", "sha1")))
+    ]
+
+    index_info = manifest["assetIndex"]
+    index_bytes = _fetch_bytes(index_info["url"])
+    if hashlib.sha1(index_bytes).hexdigest() != index_info["sha1"]:
+        raise SystemExit("the asset index does not match its published SHA-1")
+    objects = json.loads(index_bytes)["objects"]
+
+    return {
+        "version": version,
+        "manifest_url": manifest_url,
+        "client": manifest["downloads"]["client"],
+        "server": manifest["downloads"]["server"],
+        "index": index_info,
+        "libraries": libraries,
+        "asset_objects": len(objects),
+    }
+
+
 def run(args: argparse.Namespace) -> int:
     lock = load_lock(args.lock)
     version = lock["version"]
     minecraft_dir = args.minecraft_dir
-    minecraft_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.dry_run:
+        # A dry run must not create, modify or download anything. Only Mojang's
+        # small metadata is read, and only to enumerate the plan.
+        plan = enumerate_plan(lock)
+        log(f"Dry run for Minecraft {version} (nothing is written)")
+        log(f"  version JSON: {plan['manifest_url']} -> versions/{version}/{version}.json")
+        log(f"  client jar:   {plan['client']['url']}")
+        log(f"  server jar:   {plan['server']['url']}")
+        log(f"  libraries:    {len(plan['libraries'])} files")
+        log(f"  asset index:  {plan['index']['url']} -> assets/indexes/{plan['index']['id']}.json")
+        log(f"  assets:       {plan['asset_objects']} objects under assets/objects/<xx>/<sha1>")
+        log(f"  total: {len(plan['libraries']) + plan['asset_objects'] + 3} files under {minecraft_dir}")
+        log("Dry run: no file was created or modified and no archive or asset object was downloaded.")
+        return 0
+
+    minecraft_dir.mkdir(parents=True, exist_ok=True)
     manifest_url = f"{PISTON_META}/v1/packages/{lock['manifest_sha1']}/{version}.json"
     log(f"Pinned manifest: {manifest_url}")
     manifest_bytes = _fetch_bytes(manifest_url)
@@ -180,10 +242,6 @@ def run(args: argparse.Namespace) -> int:
              sha1)
         )
     log(f"Assets: {len(assets)} objects")
-
-    if args.dry_run:
-        log(f"Dry run: would ensure {len(libraries) + len(assets) + 2} files under {minecraft_dir}")
-        return 0
 
     jobs = libraries + assets
     counts = {"fetched": 0, "kept": 0}

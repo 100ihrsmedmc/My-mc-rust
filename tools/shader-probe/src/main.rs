@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use horizon_shaders::{
-    discover, dimension_folder, load_post, Pack, Properties, Macros, Lang,
+    discover, dimension_folder, load_post, options, Pack, Properties, Macros, Lang, Screens,
     GbuffersInputs, GameInputs, GeometryInputs, Parts, Post,
 };
 
@@ -278,6 +278,21 @@ fn all_modules(post: &Post) -> Vec<(String, &naga::Module)> {
     modules
 }
 
+/// The severity of one program or configuration note.
+///
+/// The loader records a program it could not load as a `"<name>: skipped"` note and
+/// every other note as information (a location the translation could not carry, a
+/// setting a later file changed). Only a skip is a critical error: it means the pack
+/// provides a program that will not run. Everything else is kept verbatim, but does
+/// not fail the run.
+fn note_severity(note: &str) -> &'static str {
+    if note.ends_with(": skipped") {
+        "error"
+    } else {
+        "info"
+    }
+}
+
 fn probe_pack(
     pack: &Pack,
     probes: &mut Vec<String>,
@@ -305,21 +320,82 @@ fn probe_pack(
     let lang = Lang::load(pack, "en_us");
     entry.insert("lang_read".into(), serde_json::json!(lang != Lang::default()));
 
-    // Preprocess every stage file of the base and each dimension folder.
+    // Preprocess every stage file of the base and each dimension folder. Keep the
+    // full text of every diagnostic and warning, located, keyed by the file that
+    // produced it: a diagnostic is a condition the preprocessor could not read, a
+    // warning one it read as false.
     let mut stage_files = 0;
-    let mut diagnostics = 0;
+    let mut stage_diagnostics: Vec<serde_json::Value> = Vec::new();
+    let mut stage_warnings: Vec<serde_json::Value> = Vec::new();
     for dir in ["", "world0", "world-1", "world1"] {
         for file in pack.list(dir) {
             if [".vsh", ".fsh", ".gsh", ".csh"].iter().any(|e| file.ends_with(e)) {
                 let path = if dir.is_empty() { file.clone() } else { format!("{dir}/{file}") };
                 let preprocessed = horizon_shaders::preprocess(pack, &path, &macros);
                 stage_files += 1;
-                diagnostics += preprocessed.diagnostics.len();
+                for (kind, list, sink) in [
+                    ("diagnostic", &preprocessed.diagnostics, &mut stage_diagnostics),
+                    ("warning", &preprocessed.warnings, &mut stage_warnings),
+                ] {
+                    for d in list {
+                        let origin = preprocessed
+                            .files
+                            .get(d.origin.file as usize)
+                            .cloned()
+                            .unwrap_or_else(|| path.clone());
+                        sink.push(serde_json::json!({
+                            "stage_file": path,
+                            "file": origin,
+                            "line": d.origin.line,
+                            "severity": kind,
+                            "message": d.message,
+                        }));
+                    }
+                }
             }
         }
     }
     entry.insert("stage_files".into(), stage_files.into());
-    entry.insert("preprocess_diagnostics".into(), diagnostics.into());
+    entry.insert("preprocess_diagnostics".into(), stage_diagnostics.len().into());
+    entry.insert("preprocess_diagnostics_detail".into(), serde_json::Value::Array(stage_diagnostics.clone()));
+    entry.insert("preprocess_warnings".into(), stage_warnings.len().into());
+    entry.insert("preprocess_warnings_detail".into(), serde_json::Value::Array(stage_warnings.clone()));
+
+    // The pack's options, screens and profiles, read as the game reads them (8.2, 8.3).
+    // `options()` and `Screens::parse` are the loader's own readers; the screen names
+    // come from the `screen`/`screen.NAME` keys, which is what `Screens::parse` reads.
+    let pack_options = options(pack);
+    let screens = Screens::parse(&properties, &pack_options);
+    let mut screen_names: Vec<String> = properties
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let key = entry.key.as_str();
+            (key == "screen").then(|| "(main)".to_owned()).or_else(|| {
+                key.strip_prefix("screen.")
+                    .filter(|rest| !rest.ends_with(".columns"))
+                    .map(str::to_owned)
+            })
+        })
+        .collect();
+    screen_names.sort();
+    screen_names.dedup();
+    entry.insert("options".into(), serde_json::json!({
+        "count": pack_options.len(),
+        "names": pack_options.keys().collect::<Vec<_>>(),
+    }));
+    entry.insert("screens".into(), serde_json::json!({
+        "count": screen_names.len(),
+        "names": screen_names,
+        "sliders": screens.sliders.iter().collect::<Vec<_>>(),
+    }));
+    entry.insert("profiles".into(), serde_json::json!({
+        "count": screens.profiles.len(),
+        "names": screens.profiles.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+    }));
+    // `config_read` is the loader's own readers having produced the pack's settings:
+    // `read_properties` (above), `options()` and `Screens::parse` all ran on the pack.
+    entry.insert("config_read".into(), serde_json::json!(true));
 
     // Every dimension's program set, loaded as the game loads it, and lowered.
     let terrain = terrain_inputs();
@@ -328,7 +404,10 @@ fn probe_pack(
     let mut backend_failures: Vec<String> = Vec::new();
     #[cfg(feature = "gpu")]
     let mut gpu_failures: Vec<String> = Vec::new();
-    let mut notes_total = 0;
+    // Every note the loader recorded while loading the programs, verbatim and
+    // classified. `post.notes` says which programs were skipped and why; the config
+    // notes say which settings conflicted or were unreadable.
+    let mut notes: Vec<serde_json::Value> = Vec::new();
     let mut dimensions = serde_json::Map::new();
     for id in [0, -1, 1] {
         let folder = dimension_folder(pack, id);
@@ -336,7 +415,22 @@ fn probe_pack(
         let post = load_post(pack, &folder, &shaders, &macros, &inputs);
         let modules = all_modules(&post);
         programs += modules.len();
-        notes_total += post.notes.len() + post.config.notes.len();
+        for note in &post.notes {
+            notes.push(serde_json::json!({
+                "dimension": id,
+                "source": "post",
+                "severity": note_severity(note),
+                "note": note,
+            }));
+        }
+        for note in &post.config.notes {
+            notes.push(serde_json::json!({
+                "dimension": id,
+                "source": "config",
+                "severity": note_severity(note),
+                "note": note,
+            }));
+        }
         for (name, module) in &modules {
             for backend in [Backend::Msl, Backend::Spv, Backend::Hlsl, Backend::Glsl] {
                 lower(name, module, backend, &mut backend_failures);
@@ -366,7 +460,8 @@ fn probe_pack(
     }
     entry.insert("dimensions".into(), serde_json::Value::Object(dimensions));
     entry.insert("modules_lowered".into(), programs.into());
-    entry.insert("post_notes".into(), notes_total.into());
+    entry.insert("post_notes".into(), notes.len().into());
+    entry.insert("notes".into(), serde_json::Value::Array(notes.clone()));
     entry.insert("backend_failures".into(), serde_json::json!(backend_failures));
     #[cfg(feature = "gpu")]
     {
@@ -374,11 +469,19 @@ fn probe_pack(
         entry.insert("gpu_failures".into(), serde_json::json!(gpu_failures));
     }
 
+    // A pack is clean when no module failed to lower, no module was rejected, and no
+    // program was skipped. Preprocess diagnostics are recorded above but are not fatal:
+    // a condition the preprocessor read as false is the pack's own behaviour, not a
+    // failure of the loader. A skipped program is fatal and is listed in `errors`.
+    let skipped: Vec<&serde_json::Value> = notes
+        .iter()
+        .filter(|n| n.get("severity").and_then(|s| s.as_str()) == Some("error"))
+        .collect();
     let applies = !pack.all_files().is_empty();
     #[cfg(not(feature = "gpu"))]
-    let clean = backend_failures.is_empty();
+    let clean = backend_failures.is_empty() && skipped.is_empty();
     #[cfg(feature = "gpu")]
-    let clean = backend_failures.is_empty() && gpu_failures.is_empty();
+    let clean = backend_failures.is_empty() && gpu_failures.is_empty() && skipped.is_empty();
     entry.insert("applies".into(), serde_json::json!(applies && clean));
 
     if clean {
@@ -395,17 +498,27 @@ fn probe_pack(
             stage_files
         ));
     } else {
+        if !skipped.is_empty() {
+            errors.push(format!(
+                "{}: {} program(s) skipped; first: {}",
+                pack.name(),
+                skipped.len(),
+                skipped[0].get("note").and_then(|n| n.as_str()).unwrap_or("")
+            ));
+        }
         #[allow(unused_mut)]
         let mut detail: Vec<String> = backend_failures.clone();
         #[cfg(feature = "gpu")]
         detail.extend(gpu_failures.iter().cloned());
-        errors.push(format!(
-            "{}: {} lowering/acceptance failure(s) across {} modules; first: {}",
-            pack.name(),
-            detail.len(),
-            programs,
-            detail.first().cloned().unwrap_or_default()
-        ));
+        if !detail.is_empty() {
+            errors.push(format!(
+                "{}: {} lowering/acceptance failure(s) across {} modules; first: {}",
+                pack.name(),
+                detail.len(),
+                programs,
+                detail.first().cloned().unwrap_or_default()
+            ));
+        }
     }
     serde_json::Value::Object(entry)
 }
@@ -492,11 +605,48 @@ fn main() -> ExitCode {
         }
     }
 
+    // Aggregate every diagnostic and note across packs so the report carries the
+    // totals without the reader having to walk each pack. `errors` counts notes that
+    // are fatal (a skipped program); warnings are the preprocessor's own warnings and
+    // the loader's informational notes, kept verbatim in each pack's `notes`.
+    let mut diag_errors = 0u64;
+    let mut diag_warnings = 0u64;
+    let mut diag_total = 0u64;
+    for pack in &packs {
+        if let Some(list) = pack.get("notes").and_then(|n| n.as_array()) {
+            for note in list {
+                diag_total += 1;
+                match note.get("severity").and_then(|s| s.as_str()) {
+                    Some("error") => diag_errors += 1,
+                    _ => diag_warnings += 1,
+                }
+            }
+        }
+        for key in ["preprocess_diagnostics", "preprocess_warnings"] {
+            if let Some(count) = pack.get(key).and_then(|c| c.as_u64()) {
+                diag_total += count;
+                if key == "preprocess_diagnostics" {
+                    diag_errors += count;
+                } else {
+                    diag_warnings += count;
+                }
+            }
+        }
+    }
+
     #[allow(unused_mut)]
     let mut report = serde_json::json!({
         "packs": packs,
         "lowered": probes,
         "failures": errors,
+        "diagnostics": {
+            "total": diag_total,
+            "errors": diag_errors,
+            "warnings": diag_warnings,
+        },
+        "severity_rules": "error: a program the loader skipped (its note ends \": skipped\") or a \
+                           preprocess diagnostic (a condition the preprocessor could not read). \
+                           info/warning: every other note, kept verbatim; these do not fail the run.",
         "caveat": "MSL/SPIR-V/HLSL/GLSL lowering proves the loader can hand a translated \
                    module to the renderer's shader writer, and (with the `gpu` feature) \
                    wgpu's `create_shader_module` accepts it on a software adapter. Neither \

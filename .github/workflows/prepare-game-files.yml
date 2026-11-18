@@ -80,7 +80,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libasound2-dev libudev-dev libcap-dev \
-            zip unzip file \
+            zip unzip file ffmpeg \
             mesa-vulkan-drivers libvulkan1
 
       - name: Install the Rust toolchain
@@ -89,6 +89,13 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
           rustc --version
+
+      - name: Run the tool regression tests
+        run: |
+          set -euo pipefail
+          # The tools gate every check below, so prove they behave first. This runs
+          # before the multi-hundred-megabyte downloads, so a broken tool fails fast.
+          python3 -m unittest discover -s tooling/tools/tests -t tooling -v
 
       - name: Read the pinned version from the lock
         id: lock
@@ -242,12 +249,15 @@ jobs:
           echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-<unset>}"
           "$RUNNER_TEMP/probe-target/release/horizon-shader-probe" \
             --dir horizon/crates/horizon-shaders/tests/packs \
+            --dir tooling/tools/shader-probe/tests/packs \
             --report "$RUNNER_TEMP/reports/shader-report.json"
           python3 tooling/tools/verify_shader.py \
             --report "$RUNNER_TEMP/reports/shader-report.json" \
             --write "$RUNNER_TEMP/reports/shader-findings.json" \
             --expect-pack post-test \
-            --expect-pack terrain-test
+            --expect-pack terrain-test \
+            --expect-pack config-test \
+            --expect-config
 
       - name: Write the validation report
         run: |

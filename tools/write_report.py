@@ -1,28 +1,62 @@
 #!/usr/bin/env python3
 """Assemble the validation report for a prepared Horizon iOS resource package.
 
-Reads the three verification reports (audio, package, shader) and the build
-metadata and writes a single Markdown report. Every line is a fact one of the
-reports established; nothing is asserted that a report did not check.
+Reads the verification reports (audio, package, shader) and the build metadata and
+writes a single Markdown report. Every line is a fact one of the reports
+established; nothing is asserted that a report did not check.
+
+This writer is a gate, not just a formatter. It exits non-zero when a required
+report is missing, is not valid JSON, does not have the shape this tool expects,
+or reports `ok: false`. That is what stops the workflow from publishing a green
+artifact after a required check failed: `write_report.py` runs before the artifact
+is assembled, and a non-zero exit fails the job.
 
 Usage:
   python3 tools/write_report.py \
       --audio audio-report.json --package package-report.json \
       --shader shader-report.json --shader-findings shader-report-annotated.json \
       --meta meta.json --out VALIDATION-REPORT.md
+  # or, when the shader step was turned off:
+  python3 tools/write_report.py --audio ... --package ... --meta ... \
+      --shader-skipped --out VALIDATION-REPORT.md
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
-def load(path: Path | None) -> dict:
-    if path is None or not path.is_file():
-        return {}
-    return json.loads(path.read_text())
+class ReportError(Exception):
+    """A required report is missing, unreadable, malformed, or reports failure."""
+
+
+def load_required(path: Path, label: str) -> dict:
+    """A report that must exist and be a JSON object."""
+    if not path.is_file():
+        raise ReportError(f"the {label} report is missing: {path}")
+    try:
+        data = json.loads(path.read_text())
+    except ValueError as error:
+        raise ReportError(f"the {label} report is not valid JSON: {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise ReportError(f"the {label} report is not a JSON object: {path}")
+    return data
+
+
+def require_keys(data: dict, label: str, keys: tuple[str, ...]) -> None:
+    missing = [key for key in keys if key not in data]
+    if missing:
+        raise ReportError(f"the {label} report is missing required field(s): {', '.join(missing)}")
+
+
+def require_ok(data: dict, label: str) -> None:
+    if data.get("ok") is not True:
+        problems = data.get("problems") or data.get("failures") or []
+        detail = f" ({'; '.join(str(p) for p in problems[:3])})" if problems else ""
+        raise ReportError(f"the {label} report reports failure: ok is {data.get('ok')!r}{detail}")
 
 
 def human_bytes(n: int | float) -> str:
@@ -35,24 +69,49 @@ def yes(flag: bool) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--audio", type=Path)
-    parser.add_argument("--package", type=Path)
+    parser.add_argument("--audio", type=Path, required=True)
+    parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--shader", type=Path)
     parser.add_argument("--shader-findings", type=Path)
-    parser.add_argument("--meta", type=Path)
+    parser.add_argument(
+        "--shader-skipped",
+        action="store_true",
+        help="the shader step was off: no shader report is expected and none is claimed",
+    )
+    parser.add_argument("--meta", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
-    audio = load(args.audio)
-    package = load(args.package)
-    shader = load(args.shader)
-    findings = load(args.shader_findings)
-    meta = load(args.meta)
+    try:
+        audio = load_required(args.audio, "audio")
+        require_keys(audio, "audio", ("ogg", "structure", "sounds_json", "asset_index", "decode", "ok"))
+        require_ok(audio, "audio")
+
+        package = load_required(args.package, "package")
+        require_keys(package, "package", ("tree", "archive_checks", "shaders", "ok"))
+        require_ok(package, "package")
+
+        meta = load_required(args.meta, "meta")
+        require_keys(meta, "meta", ("version",))
+
+        if args.shader_skipped:
+            shader, findings = {}, {}
+        else:
+            if args.shader is None or args.shader_findings is None:
+                raise ReportError("a shader report is required unless --shader-skipped is given")
+            shader = load_required(args.shader, "shader")
+            require_keys(shader, "shader", ("packs", "ok"))
+            require_ok(shader, "shader")
+            findings = load_required(args.shader_findings, "shader-findings")
+    except ReportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     ogg = audio.get("ogg", {})
     sounds = audio.get("sounds_json", {})
     index = audio.get("asset_index", {})
     structure = audio.get("structure", {})
+    decode = audio.get("decode", {})
     tree = package.get("tree", {})
     archive = package.get("archive_checks", {})
 
@@ -83,6 +142,11 @@ def main() -> int:
     add("")
     add(f"- OGG files: {ogg.get('count', '?')} ({human_bytes(ogg.get('bytes', 0))})")
     add(f"- OGG files that failed to parse: {ogg.get('failed', '?')}")
+    if decode.get("ran"):
+        add(f"- OGG files fully decoded (Vorbis, ffmpeg): {decode.get('decoded', '?')} decoded, "
+            f"{decode.get('failed', '?')} failed")
+    else:
+        add(f"- OGG files fully decoded (Vorbis): NOT RUN ({decode.get('error', 'decode stage off')})")
     add(f"- Codecs seen: {', '.join(ogg.get('codecs', {}).keys()) or 'none'}")
     add(f"- Directory structure matches Minecraft {meta.get('version', '?')}: {yes(structure.get('ok', False))}")
     add(f"- `sounds.json` present: {yes(sounds.get('present', False))}; "
@@ -91,12 +155,17 @@ def main() -> int:
     add(f"- Asset-index objects missing: {len(index.get('missing', []))}; "
         f"mismatched: {len(index.get('mismatched', []))}; extra: {index.get('extra_ogg', '?')}")
     add(f"- Audio verification: {'PASSED' if audio.get('ok') else 'FAILED'}")
+    add("- iOS device audio playback: NOT VERIFIED (needs a physical iPad; CI decodes the "
+        "streams but does not play them)")
     add("")
     if ogg.get("failures"):
         add("Failed OGG files (first 20):")
         add("")
         for failure in ogg["failures"][:20]:
-            add(f"- `{failure}`")
+            if isinstance(failure, dict):
+                add(f"- `{failure.get('file')}`: {failure.get('error')}")
+            else:
+                add(f"- `{failure}`")
         add("")
     if sounds.get("missing_files"):
         add("Missing sound resources (first 20):")
@@ -106,11 +175,11 @@ def main() -> int:
         add("")
     add("## Shaders (Iris / OptiFine packs)")
     add("")
-    packs = shader.get("packs", [])
-    if not shader:
+    if args.shader_skipped:
         add("- Shader verification was SKIPPED for this run (`verify_shaders` was off).")
         add("- Nothing about shader support is claimed by this report.")
     else:
+        packs = shader.get("packs", [])
         add(f"- Packs discovered: {len(packs)}")
         for pack in packs:
             name = pack.get("name") or pack.get("path")
@@ -128,6 +197,13 @@ def main() -> int:
                 "(no headless adapter), so only lowering is claimed.")
         add("- This proves the loader can discover, parse, translate, lower and hand packs "
             "to the renderer. It does **not** prove a pack renders correctly on a phone.")
+        diagnostics = shader.get("diagnostics", {})
+        if diagnostics:
+            add(f"- Preprocessing diagnostics: {diagnostics.get('total', 0)} "
+                f"({diagnostics.get('errors', 0)} error-level, {diagnostics.get('warnings', 0)} warning-level)")
+            for pack in packs:
+                for note in (pack.get("notes") or [])[:20]:
+                    add(f"  - note: {note}")
     add("")
     if findings.get("findings"):
         add("| Claim | Status | Detail |")
@@ -140,7 +216,10 @@ def main() -> int:
     add("")
     add(f"- Audio: {'PASSED' if audio.get('ok') else 'FAILED'}")
     add(f"- Package/archive: {'PASSED' if package.get('ok') else 'FAILED'}")
-    add(f"- Shader loader: {'PASSED' if shader.get('ok') else 'FAILED'}")
+    if args.shader_skipped:
+        add("- Shader loader: SKIPPED")
+    else:
+        add(f"- Shader loader: {'PASSED' if shader.get('ok') else 'FAILED'}")
     add("- Shader on-device rendering: NOT VERIFIED (needs a physical iPad)")
     add("")
     add("## Provenance and licensing")
@@ -149,6 +228,7 @@ def main() -> int:
     add("- Only files the pinned `research-lock.json` names are included; each was "
         "checked against its published SHA-1.")
 
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n")
     print(f"Wrote {args.out} ({len(lines)} lines)")
     return 0
