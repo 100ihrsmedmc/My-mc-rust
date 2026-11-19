@@ -146,10 +146,10 @@ def main() -> int:
     if marker.get("checked"):
         add(f"- Files matching the SHA-256 `horizon-resources.json` records: "
             f"{marker.get('checked', '?')}")
-    meta = tree.get("json_metadata", {})
-    if meta.get("checked"):
-        add(f"- JSON resources parsed: {meta.get('checked', '?')} "
-            f"({len(meta.get('problems', []))} malformed)")
+    json_meta = tree.get("json_metadata", {})
+    if json_meta.get("checked"):
+        add(f"- JSON resources parsed: {json_meta.get('checked', '?')} "
+            f"({len(json_meta.get('problems', []))} malformed)")
     add("")
     add("## Audio (OGG)")
     add("")

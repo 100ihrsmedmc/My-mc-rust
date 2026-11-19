@@ -95,6 +95,15 @@ class Gate(unittest.TestCase):
         }
         return paths
 
+    def test_the_version_reaches_the_structure_line(self):
+        # `meta` used to be rebound to the package's json_metadata block before the
+        # audio section read it, so this line printed "Minecraft ?".
+        status, _ = self.run_writer(**self.full())
+        self.assertEqual(status, 0)
+        text = (self.dir / "out.md").read_text()
+        self.assertIn("Directory structure matches Minecraft 26.3:", text)
+        self.assertNotIn("Minecraft ?", text)
+
     def test_a_complete_passing_set_writes_the_report(self):
         status, _ = self.run_writer(**self.full())
         self.assertEqual(status, 0)

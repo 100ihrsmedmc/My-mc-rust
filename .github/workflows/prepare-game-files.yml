@@ -279,14 +279,18 @@ jobs:
             "mojang_hosts": "piston-meta.mojang.com, libraries.minecraft.net, resources.download.minecraft.net"
           }
           JSON
-          # A skipped shader job leaves no report; the report then says so instead of claiming success.
-          test -f "$RUNNER_TEMP/reports/shader-report.json" || echo '{}' > "$RUNNER_TEMP/reports/shader-report.json"
-          test -f "$RUNNER_TEMP/reports/shader-findings.json" || echo '{}' > "$RUNNER_TEMP/reports/shader-findings.json"
+          # When the shader step was off there is no report, and the writer is told
+          # so rather than being handed an empty one it would rightly reject.
+          if [ "${{ inputs.verify_shaders }}" = "true" ]; then
+            shader_args=(--shader "$RUNNER_TEMP/reports/shader-report.json"
+                         --shader-findings "$RUNNER_TEMP/reports/shader-findings.json")
+          else
+            shader_args=(--shader-skipped)
+          fi
           python3 tooling/tools/write_report.py \
             --audio "$RUNNER_TEMP/reports/audio-report.json" \
             --package "$RUNNER_TEMP/reports/package-report.json" \
-            --shader "$RUNNER_TEMP/reports/shader-report.json" \
-            --shader-findings "$RUNNER_TEMP/reports/shader-findings.json" \
+            "${shader_args[@]}" \
             --meta "$RUNNER_TEMP/reports/meta.json" \
             --out "$RUNNER_TEMP/dist/VALIDATION-REPORT.md"
           cat "$RUNNER_TEMP/dist/VALIDATION-REPORT.md"
