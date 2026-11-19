@@ -35,13 +35,16 @@ def build_tree(root: Path, version: str = VERSION, schema: int = SCHEMA) -> Path
     return resources
 
 
-def build_archive(root: Path, resources: Path, name: str = "pack.zip") -> Path:
+def build_archive(root: Path, resources: Path, name: str = "pack.zip",
+                  prefix: str | None = None) -> Path:
+    """A zip of every file in `resources`, under `prefix` (the tree's own name by default)."""
     archive = root / name
-    top = resources.name
+    top = resources.name if prefix is None else prefix
     with zipfile.ZipFile(archive, "w") as zf:
         for path in sorted(resources.rglob("*")):
             if path.is_file():
-                zf.write(path, f"{top}/{path.relative_to(resources).as_posix()}")
+                relative = path.relative_to(resources).as_posix()
+                zf.write(path, f"{top}/{relative}" if top else relative)
     return archive
 
 
@@ -109,7 +112,7 @@ class Archive(unittest.TestCase):
             zf.writestr("elsewhere/file.txt", "x")
         result = verify_package.check_archive(archive, self.resources)
         self.assertFalse(result["ok"])
-        self.assertTrue(any("top folder" in p for p in result["problems"]))
+        self.assertTrue(any("no horizon-resources.json" in p for p in result["problems"]))
 
     def test_root_without_marker_fails(self):
         archive = self.root / "nomarker.zip"
@@ -117,7 +120,61 @@ class Archive(unittest.TestCase):
             zf.writestr(f"{self.resources.name}/assets/file.txt", "x")
         result = verify_package.check_archive(archive, self.resources)
         self.assertFalse(result["ok"])
-        self.assertTrue(any("does not hold" in p for p in result["problems"]))
+        self.assertTrue(any("no horizon-resources.json" in p for p in result["problems"]))
+
+    def test_a_stray_entry_beside_the_tree_fails(self):
+        # A marker under one folder, but a file that escapes it: the game reads the
+        # tree from the marker's level, so the stray is not part of the package.
+        archive = build_archive(self.root, self.resources, name="stray.zip",
+                                prefix="resources")
+        with zipfile.ZipFile(archive, "a") as zf:
+            zf.writestr("loose.txt", "x")
+        result = verify_package.check_archive(archive, self.resources)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("outside the tree" in p for p in result["problems"]))
+
+    def test_the_marker_at_the_archive_root_passes(self):
+        # Compressing the tree's contents rather than the folder: the game reads it.
+        archive = build_archive(self.root, self.resources, name="flat.zip", prefix="")
+        result = verify_package.check_archive(archive, self.resources)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["root"], "<archive root>")
+
+    def test_one_shared_folder_above_the_marker_passes(self):
+        # What `horizon-client --pack-resources` writes: everything under `resources/`.
+        archive = build_archive(self.root, self.resources, name="one.zip", prefix="resources")
+        result = verify_package.check_archive(archive, self.resources)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["root"], "resources")
+
+    def test_two_shared_folders_above_the_marker_pass(self):
+        # Somebody who compressed one folder too many: still read, as the importer does.
+        archive = build_archive(self.root, self.resources, name="two.zip",
+                                prefix="Horizon/26.3")
+        result = verify_package.check_archive(archive, self.resources)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["root"], "Horizon/26.3")
+
+    def test_three_shared_folders_above_the_marker_fail(self):
+        # One folder too many past what the importer descends: it refuses the archive.
+        archive = build_archive(self.root, self.resources, name="three.zip",
+                                prefix="a/b/c")
+        result = verify_package.check_archive(archive, self.resources)
+        self.assertFalse(result["ok"])
+
+    def test_a_tree_file_missing_from_the_archive_fails(self):
+        # The archive omits a file the prepared tree holds: the game would not have it.
+        archive = build_archive(self.root, self.resources)
+        trimmed = self.root / "trimmed.zip"
+        with zipfile.ZipFile(archive) as src, zipfile.ZipFile(trimmed, "w") as dst:
+            entries = [n for n in src.namelist() if not n.endswith("/")]
+            dropped = next(n for n in entries if n.endswith("asset-index.json"))
+            for name in entries:
+                if name != dropped:
+                    dst.writestr(name, src.read(name))
+        result = verify_package.check_archive(trimmed, self.resources)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("missing from the archive" in p for p in result["problems"]))
 
     def test_dot_dot_entry_fails(self):
         archive = self.root / "unsafe.zip"

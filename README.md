@@ -118,6 +118,9 @@ in `VALIDATION-REPORT.md`'s findings table, which marks on-device rendering
 
 - the prepared tree's layout and schema (7) and the Minecraft version it claims;
 - the archive's integrity, entry count and that every tree file is in it;
+- that the game will find the tree at all: `horizon-resources.json` must sit at the
+  archive root or under at most two shared folders (`resources/`, `Horizon/26.3/`),
+  the same descent `Pack::open` makes, with nothing left outside that root;
 - that every `#include`/`#moj_import` the vanilla core shaders name resolves to a
   file the package carries (`assets/<ns>/shaders/...`), so no core shader is left
   uncompilable — the same resolution `horizon-client-render`'s `core_shader` does;

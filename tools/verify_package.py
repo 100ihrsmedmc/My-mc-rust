@@ -314,6 +314,41 @@ def check_marker_hashes(resources: Path, data: dict) -> dict:
     return result
 
 
+def _common_folder(names: list[str], prefix: str) -> str | None:
+    """The one folder every entry shares one level below `prefix`, if there is one.
+
+    Mirrors `import.rs`'s `common_folder`: what compressing a folder produces, as
+    opposed to compressing its contents.
+    """
+    rest = [n[len(prefix):] for n in names if n.startswith(prefix)]
+    rest = [r for r in rest if "/" in r]
+    if not rest:
+        return None
+    first = rest[0].split("/", 1)[0]
+    if all(r.startswith(first) and r[len(first):].startswith("/") for r in rest):
+        return first
+    return None
+
+
+def _root_prefix(names: list[str]) -> str | None:
+    """The folder the game reads the tree from: `""` or up to two shared folders.
+
+    Mirrors `Pack::open`: the importer descends through at most two common folders
+    looking for the marker, because compressing `.local/horizon-client` rather than
+    `26.3` is a mistake a careful person still makes. Returns `None` when no marker
+    sits at any of those levels, which is exactly when the game refuses the archive.
+    """
+    prefix = ""
+    for _ in range(3):
+        if f"{prefix}{MARKER}" in names:
+            return prefix
+        folder = _common_folder(names, prefix)
+        if folder is None:
+            return None
+        prefix += folder + "/"
+    return None
+
+
 def check_archive(archive: Path, resources: Path) -> dict:
     result: dict = {"ok": True, "problems": [], "warnings": []}
     if not archive.is_file():
@@ -335,24 +370,45 @@ def check_archive(archive: Path, resources: Path) -> dict:
                 result["ok"] = False
                 result["problems"].append("the archive holds nothing")
                 return result
-            # Every entry shares the prepared folder's name at the top.
-            top = resources.name
-            bad = [n for n in names if not n.startswith(top + "/")]
-            if bad:
+            # The game reads the tree from the marker's own level: the archive root,
+            # or up to two shared folders above it (`resources/`, `Horizon/26.3/`).
+            prefix = _root_prefix(names)
+            if prefix is None:
                 result["ok"] = False
                 result["problems"].append(
-                    f"{len(bad)} entries are not under the top folder {top!r} (e.g. {bad[0]})"
+                    f"no {MARKER} sits at the archive root or under up to two shared "
+                    "folders: the game will not read this as its game files"
                 )
+            else:
+                result["root"] = prefix.rstrip("/") or "<archive root>"
+                stray = [n for n in names if not n.startswith(prefix)]
+                if stray:
+                    result["ok"] = False
+                    result["problems"].append(
+                        f"{len(stray)} entries sit outside the tree the game reads "
+                        f"({prefix.rstrip('/') or '<root>'}) (e.g. {stray[0]})"
+                    )
+                # Every file the prepared tree holds must be in the archive, at the
+                # same place below the root: a tree file the archive drops is a
+                # resource the game will not have.
+                in_archive = set(names)
+                missing = [
+                    path.relative_to(resources).as_posix()
+                    for path in sorted(resources.rglob("*"))
+                    if path.is_file()
+                    and f"{prefix}{path.relative_to(resources).as_posix()}" not in in_archive
+                ]
+                if missing:
+                    result["ok"] = False
+                    result["problems"].append(
+                        f"{len(missing)} tree files are missing from the archive "
+                        f"(e.g. {missing[0]})"
+                    )
             for name in names:
                 if name.startswith("/") or ":" in name or ".." in name.split("/"):
                     result["ok"] = False
                     result["problems"].append(f"unsafe archive entry {name!r}")
                     break
-            if f"{top}/{MARKER}" not in zf.namelist():
-                result["ok"] = False
-                result["problems"].append(
-                    f"the archive's root does not hold {MARKER}: the game will not read it as game files"
-                )
             if zf.testzip() is not None:
                 result["ok"] = False
                 result["problems"].append("the archive is corrupt (a member failed its CRC)")
